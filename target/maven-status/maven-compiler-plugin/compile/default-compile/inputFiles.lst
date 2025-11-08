@@ -1,0 +1,14 @@
+/root/nameguard/src/main/java/com/zeroends/nameguard/NameGuard.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/command/NameGuardCommand.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/listener/PlayerConnectionListener.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/manager/BindingManager.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/manager/ConfigManager.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/manager/FingerprintManager.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/model/AccountType.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/model/Binding.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/model/Fingerprint.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/model/LoginResult.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/storage/IStorage.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/storage/YamlStorage.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/util/IpHeuristicUtil.java
+/root/nameguard/src/main/java/com/zeroends/nameguard/util/NormalizationUtil.java

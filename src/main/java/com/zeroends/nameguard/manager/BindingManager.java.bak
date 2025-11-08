@@ -1,0 +1,213 @@
+package com.zeroends.nameguard.manager;
+
+import com.zeroends.nameguard.NameGuard;
+import com.zeroends.nameguard.model.AccountType;
+import com.zeroends.nameguard.model.Binding;
+import com.zeroends.nameguard.model.Fingerprint;
+import com.zeroends.nameguard.model.LoginResult;
+import com.zeroends.nameguard.storage.IStorage;
+import com.zeroends.nameguard.util.NormalizationUtil;
+import net.kyori.adventure.text.Component;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.geysermc.floodgate.api.player.FloodgatePlayer;
+import org.jetbrains.annotations.NotNull;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Manages the core logic of creating, verifying, and persisting identity bindings.
+ */
+public class BindingManager {
+
+    private final NameGuard plugin;
+    private final IStorage storage;
+    private final NormalizationUtil normalizationUtil;
+    private final FingerprintManager fingerprintManager;
+    private final ConfigManager configManager;
+    private final Map<String, Binding> bindingCache = new ConcurrentHashMap<>();
+
+    public BindingManager(NameGuard plugin, IStorage storage, NormalizationUtil normalizationUtil, FingerprintManager fingerprintManager) {
+        this.plugin = plugin;
+        this.storage = storage;
+        this.normalizationUtil = normalizationUtil;
+        this.fingerprintManager = fingerprintManager;
+        this.configManager = plugin.getConfigManager();
+    }
+
+    /**
+     * Loads all bindings from storage into the in-memory cache.
+     */
+    public void loadAllBindings() {
+    /** Expose seluruh binding yang sudah ada di cache */
+    public java.util.Map<String, com.zeroends.nameguard.model.Binding> getAllBindings() {
+        return bindingCache;
+    }
+        try {
+            bindingCache.putAll(storage.loadAllBindings());
+        } catch (IOException e) {
+            plugin.getSLF4JLogger().error("Failed to load bindings from storage.", e);
+        }
+    }
+
+    /**
+     * Saves all cached bindings back to storage.
+     */
+    public void saveAllBindings() {
+        plugin.getSLF4JLogger().info("Saving {} bindings to storage...", bindingCache.size());
+        for (Binding binding : bindingCache.values()) {
+            try {
+                storage.saveBinding(binding);
+            } catch (IOException e) {
+                plugin.getSLF4JLogger().error("Failed to save binding for: {}", binding.getNormalizedName(), e);
+            }
+        }
+        storage.shutdown();
+    }
+
+    /**
+     * The main verification logic called during AsyncPlayerPreLoginEvent.
+     *
+     * @param event The login event.
+     * @return A LoginResult (Allowed or Denied).
+     */
+    @NotNull
+    public LoginResult verifyLogin(@NotNull AsyncPlayerPreLoginEvent event) {
+        String originalName = event.getName();
+        String normalizedName = normalizationUtil.normalizeName(originalName);
+
+        // 1. Determine AccountType (Bedrock or Java)
+        AccountType accountType = plugin.getFloodgateApi()
+                .map(api -> api.isFloodgatePlayer(event.getUniqueId()))
+                .orElse(false) ? AccountType.BEDROCK : AccountType.JAVA;
+        
+        // 2. Create the new fingerprint for this login attempt
+        Fingerprint newFingerprint = fingerprintManager.createFingerprint(event, accountType);
+
+        // 3. Get existing binding, if it exists
+        Optional<Binding> existingBindingOpt = getBinding(normalizedName);
+
+        if (existingBindingOpt.isPresent()) {
+            // --- KASUS: Nama sudah ada (Verifikasi) ---
+            Binding binding = existingBindingOpt.get();
+            binding.updateLastSeen();
+
+            // Kasus 10: Spoof via casing/confusable
+            // Jika nama asli tidak sama persis DENGAN nama pilihan, dan normalisasinya SAMA
+            if (!binding.getPreferredName().equals(originalName)) {
+                plugin.getSLF4JLogger().warn("Login denied for '{}' (normalized: {}): Attempted to use confusable name (real: {}).",
+                        originalName, normalizedName, binding.getPreferredName());
+                return new LoginResult.Denied(
+                        LoginResult.Reason.CONFUSABLE_NAME_SPOOF,
+                        configManager.getKickMessage("confusableName")
+                );
+            }
+            
+            // Kasus 4 & 5: Cek Cross-Edition Lock
+            if (configManager.isCrossEditionLock() && binding.getAccountType() != accountType) {
+                plugin.getSLF4JLogger().warn("Login denied for '{}': Cross-edition lock active (Binding: {}, Attempt: {}).",
+                        originalName, binding.getAccountType(), accountType);
+                return new LoginResult.Denied(
+                        LoginResult.Reason.CROSS_EDITION_LOCK,
+                        configManager.getKickMessage("crossEditionLock")
+                );
+            }
+
+            // Kasus 3 & 6 & 7: Verifikasi Fingerprint (L2)
+            boolean exactMatch = false;
+            boolean softMatch = false;
+
+            for (Fingerprint fp : binding.getFingerprints()) {
+                double similarity = fingerprintManager.getSimilarity(fp, newFingerprint);
+                if (similarity == 1.0) {
+                    exactMatch = true;
+                    break;
+                }
+                if (similarity >= configManager.getSimilarityThresholdSoft()) {
+                    softMatch = true;
+                }
+            }
+
+            if (exactMatch) {
+                // Lolos, FP sama persis
+                return new LoginResult.Allowed(binding, false, false);
+            }
+
+            if (softMatch) {
+                // Kasus 6: Lolos, FP "cukup mirip"
+                binding.addFingerprint(newFingerprint, configManager.getRollingFpLimit());
+                saveBinding(binding); // Async save
+                return new LoginResult.Allowed(binding, false, true);
+            }
+
+            // Kasus 3 & 7: Gagal, FP sangat berbeda
+            plugin.getSLF4JLogger().warn("Login denied for '{}': Hard fingerprint mismatch (Threshold: {}).",
+                    originalName, configManager.getSimilarityThresholdHard());
+            // Kirim notifikasi ke admin
+            
+            // FIX: Panggil getPlugin() dari configManager (yang sudah kita perbaiki)
+            String adminMsgRaw = configManager.getPlugin().getConfig().getString("messages.adminMismatchNotify", "");
+            Component adminMsg = Component.text(adminMsgRaw.replace("{player}", originalName));
+            
+            plugin.getServer().broadcast(adminMsg, "nameguard.admin");
+            
+            return new LoginResult.Denied(
+                    LoginResult.Reason.HARD_MISMATCH,
+                    configManager.getKickMessage("hardMismatch")
+            );
+
+        } else {
+            // --- KASUS: Nama baru (Reservasi) ---
+            // Kasus 1 & 2
+            plugin.getSLF4JLogger().info("Creating new binding for '{}' (Type: {}).", originalName, accountType);
+            Binding newBinding = new Binding(normalizedName, originalName, accountType, newFingerprint);
+            
+            // Simpan binding baru
+            saveBinding(newBinding);
+            
+            return new LoginResult.Allowed(newBinding, true, false);
+        }
+    }
+
+    @NotNull
+    public Optional<Binding> getBinding(@NotNull String normalizedName) {
+        Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
+        return Optional.ofNullable(bindingCache.get(normalizedName));
+    }
+
+    public void saveBinding(@NotNull Binding binding) {
+        Objects.requireNonNull(binding, "Binding cannot be null");
+        bindingCache.put(binding.getNormalizedName(), binding);
+        try {
+            storage.saveBinding(binding);
+        } catch (IOException e) {
+            plugin.getSLF4JLogger().error("Failed to save binding for: {}", binding.getNormalizedName(), e);
+        }
+    }
+
+    public boolean removeBinding(@NotNull String normalizedName) {
+        Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
+        if (bindingCache.remove(normalizedName) != null) {
+            try {
+                storage.removeBinding(normalizedName);
+                return true;
+            } catch (IOException e) {
+                plugin.getSLF4JLogger().error("Failed to remove binding for: {}", normalizedName, e);
+                return false;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Reloads the in-memory cache from storage.
+     * This is a destructive operation and should be used carefully.
+     */
+    public void reloadBindings() {
+        this.bindingCache.clear();
+        this.loadAllBindings();
+    }
+}
