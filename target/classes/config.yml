@@ -1,0 +1,86 @@
+# NameGuard Configuration File
+# version: 3.0 (Heuristic Scoring)
+
+# --- Kebijakan Verifikasi (Verification Policy) ---
+verification:
+  # Jika true, pemain Bedrock tidak bisa memakai nama yang sudah di-bind oleh Java,
+  # dan pemain Java tidak bisa memakai nama yang sudah di-bind oleh Bedrock.
+  crossEditionLock: true
+
+  # Jumlah maksimum fingerprint yang disimpan per pemain (rolling window).
+  # 5-10 direkomendasikan.
+  rollingFpLimit: 5
+
+  # Durasi (dalam hari) sebelum fingerprint lama yang tidak terpakai dihapus.
+  # 0 untuk menonaktifkan.
+  fingerprintPurgeDays: 90
+
+  # --- Pengaturan GeoIP (GeoIP Settings) ---
+  # GeoIP (MaxMind) tidak lagi digunakan di V3. Pengaturan ini diabaikan.
+  geoip:
+    enabled: false
+
+  # --- Pengaturan Skoring Heuristik (Heuristic Scoring) ---
+  # Skor dihitung berdasarkan poin.
+  # XUID (Bedrock) akan selalu dianggap 100 poin (Hard Allow).
+  
+  # Ambang batas skor kemiripan (Total poin maks adalah 100).
+  similarity:
+    # Skor minimal untuk diizinkan masuk tanpa peringatan.
+    hard_allow: 70
+    
+    # Skor minimal untuk diizinkan masuk, tetapi fingerprint baru akan ditambahkan (auto-learning).
+    soft_allow: 40
+    
+    # Jika skor < soft_allow, login akan DITOLAK.
+
+  # Bobot skor untuk setiap sinyal.
+  weights:
+    # Sinyal non-jaringan (Paling Penting)
+    deviceos_weight: 30
+    brand_weight: 25
+    edition_weight: 15
+    
+    # Sinyal jaringan (Heuristik)
+    subnet_weight: 15
+    pseudo_asn_weight: 8
+    ptr_domain_weight: 5
+    ip_version_weight: 2
+
+# --- Keamanan (Security) ---
+security:
+  # SALT UNTUK HMAC-SHA256
+  # Ini digunakan untuk meng-hash sinyal fingerprint.
+  # GANTI INI DENGAN STRING ACAK YANG PANJANG DAN RAHASIA!
+  # Jangan pernah bagikan salt ini.
+  # Hapus file identities.yml jika Anda mengubah salt ini.
+  salt: "vWLTFPtdyYbqLMgFuqt2DecUjb1UP4ZT"
+  
+  # Pesan yang ditampilkan saat login ditolak.
+  kickMessage: "&c[NameGuard]\n&fKoneksi Anda ditolak.\n&7Alasan: {reason}"
+
+  # Alasan spesifik
+  reasons:
+    hardMismatch: "Identitas login tidak cocok dengan pemilik nama (Skor < 40)."
+    crossEditionLock: "Nama ini dikunci untuk edisi game yang berbeda (Java/Bedrock)."
+    rateLimited: "Terlalu banyak percobaan login. Coba lagi nanti."
+    confusableName: "Nama Anda terlalu mirip dengan nama yang sudah dilindungi."
+    internalError: "Terjadi error internal saat verifikasi."
+
+  # Pengaturan Rate Limiter untuk percobaan login gagal per IP.
+  rateLimit:
+    enabled: true
+    attempts: 5
+    blockDurationSeconds: 300 # 5 menit
+
+# --- Pesan (Messages) ---
+messages:
+  # Pesan yang dikirim ke pemain saat nama mereka berhasil dilindungi pertama kali.
+  protectionSuccess: "§a[NameGuard] Namamu sekarang dilindungi. Perubahan login yang ekstrem mungkin memerlukan verifikasi."
+  
+  # Pesan untuk admin saat pemain diblokir karena HARD_MISMATCH.
+  adminMismatchNotify: "§c[NameGuard] &ePemain {player} §cdiblokir (HARD_MISMATCH). Jika ini pemain asli, minta mereka kontak Anda dan gunakan §f/ng bind {player}"
+
+debug:
+  # Aktifkan logging mendetail di konsol untuk debugging.
+  logFailedAttempts: true

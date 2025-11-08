@@ -1,0 +1,16 @@
+name: NameGuard
+version: '1.0.0-SNAPSHOT'
+main: com.zeroends.nameguard.NameGuard
+api-version: '1.21'
+author: zeroends
+description: Identity protection system for Minecraft servers
+softdepend: [Floodgate]
+commands:
+  nameguard:
+    description: Main command for NameGuard administration.
+    aliases: [ng]
+    permission: nameguard.admin
+permissions:
+  nameguard.admin:
+    description: Allows access to all NameGuard admin commands.
+    default: op
