@@ -25,6 +25,13 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+/**
+ * Administrative command executor for NameGuard.
+ *
+ * V4 Update:
+ *  - /ng check now displays Geo-IP fields (countryCode, region/city, ASN, ORG, ISP) for each fingerprint when available.
+ *  - Helps admins audit cross-country anomalies and provider changes.
+ */
 public class NameGuardCommand implements CommandExecutor, TabCompleter {
 
     private final NameGuard plugin;
@@ -67,7 +74,7 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
     private void handleReload(CommandSender sender) {
         plugin.getSLF4JLogger().info("Reloading NameGuard configuration...");
         configManager.loadConfig();
-        // Reload bindings (just saves and clears cache in V3 Hybrid)
+        // Reload bindings (save + clear cache in hybrid model)
         bindingManager.reloadBindings();
         sender.sendMessage(Component.text("NameGuard configuration and bindings cache reloaded.", NamedTextColor.GREEN));
     }
@@ -80,7 +87,6 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
         String playerName = args[1];
         String normalizedName = normalizationUtil.normalizeName(playerName);
 
-        // This method works for both online (cache) and offline (disk) players
         if (bindingManager.removeBinding(normalizedName)) {
             sender.sendMessage(Component.text("Successfully unbound name: " + playerName, NamedTextColor.GREEN));
             plugin.getSLF4JLogger().info("Admin {} unbound name: {}", sender.getName(), playerName);
@@ -104,9 +110,8 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
         }
 
         String normalizedName = normalizationUtil.normalizeName(target.getName());
-        
+
         try {
-            // getBinding might perform I/O, but player is online, so it should be in cache
             Binding binding = bindingManager.getBinding(normalizedName).orElse(null);
 
             if (binding == null) {
@@ -129,7 +134,7 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
 
             sender.sendMessage(Component.text("Successfully bound " + playerName + " to their current fingerprint and locked their account.", NamedTextColor.GREEN));
             target.sendMessage(Component.text("An admin has manually verified and locked your NameGuard identity.", NamedTextColor.GOLD));
-        
+
         } catch (IOException e) {
             sender.sendMessage(Component.text("An I/O error occurred while retrieving binding. See console.", NamedTextColor.RED));
             plugin.getSLF4JLogger().error("I/O error during /ng bind:", e);
@@ -145,7 +150,6 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
         String normalizedName = normalizationUtil.normalizeName(playerName);
 
         try {
-            // This will now load from disk if the player is offline
             bindingManager.getBinding(normalizedName).ifPresentOrElse(binding -> {
                 sender.sendMessage(Component.text("--- NameGuard Check: " + binding.getPreferredName() + " ---", NamedTextColor.GOLD));
                 sender.sendMessage(Component.text("Normalized: ", NamedTextColor.GRAY).append(Component.text(binding.getNormalizedName(), NamedTextColor.WHITE)));
@@ -162,23 +166,33 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
                     sendInfo(sender, "    XUID", fp.getXuid());
                     sendInfo(sender, "    JavaUUID", fp.getJavaUuid());
                     sendInfo(sender, "    Edition", fp.getEdition().name());
-                    
-                    // V3 fields
+
+                    // V3 network heuristic hashes
                     sendInfo(sender, "    IP Version", fp.getIpVersion());
                     sendInfo(sender, "    Subnet Hash", fp.getHashedPrefix());
                     sendInfo(sender, "    Pseudo-ASN Hash", fp.getHashedPseudoAsn());
                     sendInfo(sender, "    PTR Hash", fp.getHashedPtr());
-                    // End V3
-                    
+
+                    // Client signals
                     sendInfo(sender, "    Device OS", fp.getDeviceOs());
                     sendInfo(sender, "    Brand", fp.getClientBrand());
                     sendInfo(sender, "    Protocol", fp.getProtocolVersion());
+
+                    // Geo signals (V4)
+                    sendInfo(sender, "    Country Code", fp.getCountryCode());
+                    // If city absent, region can serve as fallback
+                    sendInfo(sender, "    Region", fp.getRegion());
+                    sendInfo(sender, "    City", fp.getCity());
+                    sendInfo(sender, "    ASN", fp.getAsn());
+                    sendInfo(sender, "    Org", fp.getOrg());
+                    sendInfo(sender, "    ISP", fp.getIsp());
+
                     i++;
                 }
             }, () -> {
                 sender.sendMessage(Component.text("No binding found for name: " + playerName, NamedTextColor.RED));
             });
-            
+
         } catch (IOException e) {
             sender.sendMessage(Component.text("An I/O error occurred while checking binding. See console.", NamedTextColor.RED));
             plugin.getSLF4JLogger().error("I/O error during /ng check:", e);
@@ -186,7 +200,7 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
     }
 
     private void sendInfo(CommandSender sender, String key, @Nullable String value) {
-        if (value != null) {
+        if (value != null && !value.isEmpty()) {
             sender.sendMessage(Component.text(key + ": ", NamedTextColor.GRAY).append(Component.text(value, NamedTextColor.WHITE)));
         }
     }
@@ -220,17 +234,14 @@ public class NameGuardCommand implements CommandExecutor, TabCompleter {
                     .collect(Collectors.toList());
         }
         if (args.length == 2 && (args[0].equalsIgnoreCase("unbind") || args[0].equalsIgnoreCase("check"))) {
-            // Suggest online players (who are in the cache)
-            // Admins can still type offline names
             return bindingManager.getBindingCache().values().stream()
-                    .filter(obj -> obj instanceof Binding) // Ensure it's a Binding
+                    .filter(obj -> obj instanceof Binding)
                     .map(obj -> ((Binding) obj).getPreferredName())
                     .filter(Objects::nonNull)
                     .filter(name -> name.toLowerCase().startsWith(args[1].toLowerCase()))
                     .collect(Collectors.toList());
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("bind")) {
-            // Suggest online players
             return Bukkit.getOnlinePlayers().stream()
                     .map(Player::getName)
                     .filter(name -> name.toLowerCase().startsWith(args[1].toLowerCase()))
