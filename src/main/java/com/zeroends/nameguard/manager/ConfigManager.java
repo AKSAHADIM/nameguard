@@ -56,6 +56,16 @@ public class ConfigManager {
     private int rateLimitAttempts;
     private long rateLimitBlockDurationMillis;
 
+    // Geo (new - ipwho.is backed)
+    private boolean geoEnabled;
+    private int geoRequestTimeoutMillis;
+    private int geoCacheTtlMinutes;
+    private int geoWeightCountry;
+    private int geoWeightAsn;
+    private int geoWeightCity; // can be used as region_weight if city unreliable
+    private boolean geoDisallowHardAllowOnCountryMismatch;
+    private boolean geoAllowCountryMismatchForTrustHigh;
+
     // Messages
     private Component protectionSuccessMessage;
 
@@ -119,14 +129,26 @@ public class ConfigManager {
         rawKickMessage = config.getString("security.kickMessage", "&c[NameGuard]\n&fKoneksi Anda ditolak.\n&7Alasan: {reason}");
 
         kickReasons.clear();
-        Objects.requireNonNull(config.getConfigurationSection("security.reasons")).getKeys(false).forEach(key -> {
-            String reason = config.getString("security.reasons." + key, "Alasan tidak diketahui.");
-            kickReasons.put(key, reason);
-        });
+        if (config.getConfigurationSection("security.reasons") != null) {
+            Objects.requireNonNull(config.getConfigurationSection("security.reasons")).getKeys(false).forEach(key -> {
+                String reason = config.getString("security.reasons." + key, "Alasan tidak diketahui.");
+                kickReasons.put(key, reason);
+            });
+        }
 
         rateLimitEnabled = config.getBoolean("security.rateLimit.enabled", true);
         rateLimitAttempts = config.getInt("security.rateLimit.attempts", 5);
         rateLimitBlockDurationMillis = config.getLong("security.rateLimit.blockDurationSeconds", 300) * 1000;
+
+        // --- Load Geo (ipwho.is, optional) ---
+        geoEnabled = config.getBoolean("verification.geo.enabled", true);
+        geoRequestTimeoutMillis = config.getInt("verification.geo.requestTimeoutMillis", 1200);
+        geoCacheTtlMinutes = config.getInt("verification.geo.cacheTtlMinutes", 720);
+        geoWeightCountry = config.getInt("verification.geo.weights.country_weight", 18);
+        geoWeightAsn = config.getInt("verification.geo.weights.asn_weight", 12);
+        geoWeightCity = config.getInt("verification.geo.weights.city_weight", 6);
+        geoDisallowHardAllowOnCountryMismatch = config.getBoolean("verification.geo.policy.disallowHardAllowOnCountryMismatch", true);
+        geoAllowCountryMismatchForTrustHigh = config.getBoolean("verification.geo.policy.allowCountryMismatchForTrustHigh", true);
 
         // --- Load Messages ---
         String successMsg = config.getString("messages.protectionSuccess", "&a[NameGuard] Namamu sekarang dilindungi...");
@@ -252,6 +274,40 @@ public class ConfigManager {
 
     public long getRateLimitBlockDurationMillis() {
         return rateLimitBlockDurationMillis;
+    }
+
+    // --- Geo (new) ---
+
+    public boolean isGeoEnabled() {
+        return geoEnabled;
+    }
+
+    public int getGeoRequestTimeoutMillis() {
+        return geoRequestTimeoutMillis;
+    }
+
+    public int getGeoCacheTtlMinutes() {
+        return geoCacheTtlMinutes;
+    }
+
+    public int getGeoWeightCountry() {
+        return geoWeightCountry;
+    }
+
+    public int getGeoWeightAsn() {
+        return geoWeightAsn;
+    }
+
+    public int getGeoWeightCity() {
+        return geoWeightCity;
+    }
+
+    public boolean isGeoDisallowHardAllowOnCountryMismatch() {
+        return geoDisallowHardAllowOnCountryMismatch;
+    }
+
+    public boolean isGeoAllowCountryMismatchForTrustHigh() {
+        return geoAllowCountryMismatchForTrustHigh;
     }
 
     // --- Messages ---
