@@ -18,7 +18,7 @@ public class ConfigManager {
 
     private final NameGuard plugin;
     private FileConfiguration config;
-    
+
     private final LegacyComponentSerializer legacySerializer;
 
     // --- Cached Config Values ---
@@ -38,6 +38,11 @@ public class ConfigManager {
     private int weightPseudoAsn;
     private int weightPtrDomain;
     private int weightIpVersion;
+
+    // Strict verification (new)
+    private boolean strictRequireNetworkOverlap;
+    private int strictMinNetworkMatchesForHardAllow;
+    private boolean strictAllowZeroNetworkForTrustHigh;
 
     // Ownership
     private long takeoverGracePeriodMillis;
@@ -78,7 +83,7 @@ public class ConfigManager {
         // --- Load Scoring (V3 Heuristics) ---
         scoreHardAllow = config.getInt("verification.similarity.hard_allow", 70);
         scoreSoftAllow = config.getInt("verification.similarity.soft_allow", 40);
-        
+
         weightDeviceOs = config.getInt("verification.weights.deviceos_weight", 30);
         weightBrand = config.getInt("verification.weights.brand_weight", 25);
         weightEdition = config.getInt("verification.weights.edition_weight", 15);
@@ -86,6 +91,15 @@ public class ConfigManager {
         weightPseudoAsn = config.getInt("verification.weights.pseudo_asn_weight", 8);
         weightPtrDomain = config.getInt("verification.weights.ptr_domain_weight", 5);
         weightIpVersion = config.getInt("verification.weights.ip_version_weight", 2);
+
+        // --- Load Strict Verification (new) ---
+        // Defaults are opinionated to prevent "client-only" hard allow:
+        // - requireNetworkOverlap: true
+        // - minNetworkMatchesForHardAllow: 1
+        // - allowZeroNetworkForTrustHigh: false
+        strictRequireNetworkOverlap = config.getBoolean("verification.strict.requireNetworkOverlap", true);
+        strictMinNetworkMatchesForHardAllow = config.getInt("verification.strict.minNetworkMatchesForHardAllow", 1);
+        strictAllowZeroNetworkForTrustHigh = config.getBoolean("verification.strict.allowZeroNetworkForTrustHigh", false);
 
         // --- Load Ownership ---
         takeoverGracePeriodMillis = config.getLong("ownership.takeoverGracePeriodMinutes", 1440) * 60 * 1000;
@@ -101,22 +115,22 @@ public class ConfigManager {
             plugin.getSLF4JLogger().warn("===================================================================");
             hmacSalt = UUID.randomUUID().toString() + UUID.randomUUID().toString();
         }
-        
+
         rawKickMessage = config.getString("security.kickMessage", "&c[NameGuard]\n&fKoneksi Anda ditolak.\n&7Alasan: {reason}");
-        
+
         kickReasons.clear();
         Objects.requireNonNull(config.getConfigurationSection("security.reasons")).getKeys(false).forEach(key -> {
             String reason = config.getString("security.reasons." + key, "Alasan tidak diketahui.");
             kickReasons.put(key, reason);
         });
-        
+
         rateLimitEnabled = config.getBoolean("security.rateLimit.enabled", true);
         rateLimitAttempts = config.getInt("security.rateLimit.attempts", 5);
         rateLimitBlockDurationMillis = config.getLong("security.rateLimit.blockDurationSeconds", 300) * 1000;
 
         // --- Load Messages ---
         String successMsg = config.getString("messages.protectionSuccess", "&a[NameGuard] Namamu sekarang dilindungi...");
-        protectionSuccessMessage = successMsg.isEmpty() ? Component.empty() : legacySerializer.deserialize(successMsg);
+        protectionSuccessMessage = (successMsg == null || successMsg.isEmpty()) ? Component.empty() : legacySerializer.deserialize(successMsg);
 
         // --- Load Debug ---
         logFailedAttempts = config.getBoolean("debug.logFailedAttempts", true);
@@ -184,6 +198,33 @@ public class ConfigManager {
         return weightIpVersion;
     }
 
+    // --- Strict verification getters (new) ---
+
+    /**
+     * If true, require at least some network overlap between new and old fingerprints
+     * for an attempt to be considered legitimate.
+     */
+    public boolean isStrictRequireNetworkOverlap() {
+        return strictRequireNetworkOverlap;
+    }
+
+    /**
+     * Minimum number of matching network signals (prefix/ASN/PTR) required to be eligible
+     * for hard allow. Recommended >= 1 to prevent client-only hard allow.
+     */
+    public int getStrictMinNetworkMatchesForHardAllow() {
+        return strictMinNetworkMatchesForHardAllow;
+    }
+
+    /**
+     * If true, trust HIGH or LOCKED bindings may bypass the zero-network-overlap restriction.
+     */
+    public boolean isStrictAllowZeroNetworkForTrustHigh() {
+        return strictAllowZeroNetworkForTrustHigh;
+    }
+
+    // --- Ownership ---
+
     public long getTakeoverGracePeriodMillis() {
         return takeoverGracePeriodMillis;
     }
@@ -191,11 +232,15 @@ public class ConfigManager {
     public long getLowTrustPlaytimeMillis() {
         return lowTrustPlaytimeMillis;
     }
-    
+
+    // --- Security ---
+
     @NotNull
     public String getHmacSalt() {
         return hmacSalt;
     }
+
+    // --- Rate limiting ---
 
     public boolean isRateLimitEnabled() {
         return rateLimitEnabled;
@@ -209,10 +254,14 @@ public class ConfigManager {
         return rateLimitBlockDurationMillis;
     }
 
+    // --- Messages ---
+
     @NotNull
     public Component getProtectionSuccessMessage() {
         return protectionSuccessMessage;
     }
+
+    // --- Debug ---
 
     public boolean isLogFailedAttempts() {
         return logFailedAttempts;
