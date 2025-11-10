@@ -106,6 +106,7 @@ public class Binding implements Serializable {
 
     /**
      * Adds a new fingerprint, automatically managing the rolling list limit.
+     * If as a result only a migrated (broken) fingerprint remains, it will be purged.
      * @param fp The new fingerprint to add.
      * @param limit The maximum number of fingerprints to keep.
      */
@@ -113,9 +114,10 @@ public class Binding implements Serializable {
         Objects.requireNonNull(fp);
         if (!fingerprints.contains(fp)) {
             fingerprints.add(fp);
+            // Evict migrated_v2 fingerprints if present
+            fingerprints.removeIf(oldFp -> isMigratedDummy(oldFp) && fingerprints.size() > 1);
             // Evict oldest if limit is exceeded
             while (limit > 0 && fingerprints.size() > limit) {
-                // Find the oldest fingerprint to remove
                 fingerprints.stream()
                         .min((fp1, fp2) -> Long.compare(fp1.getCreatedAt(), fp2.getCreatedAt()))
                         .ifPresent(fingerprints::remove);
@@ -135,6 +137,8 @@ public class Binding implements Serializable {
 
         long purgeBefore = System.currentTimeMillis() - purgeMillis;
         fingerprints.removeIf(fp -> fingerprints.size() > minToKeep && fp.getCreatedAt() < purgeBefore);
+        // Jangan pertahankan migrated_v2 dummy jika fingerprint normal sudah tersedia
+        fingerprints.removeIf(this::isMigratedDummy);
     }
 
     public long getFirstSeen() {
@@ -194,6 +198,7 @@ public class Binding implements Serializable {
     /**
      * Helper method to manually construct a Binding from a Map (like a LinkedHashMap from SnakeYAML).
      * Uses Fingerprint.fromMap which now supports V4 (geo fields optional).
+     * If a fingerprint entry cannot be parsed (legacy), it will be ignored/replaced on next login.
      * @param normalizedName The key (normalized name) of the binding.
      * @param map The map of values from YAML.
      * @return A new Binding object.
@@ -218,11 +223,15 @@ public class Binding implements Serializable {
                 try {
                     fingerprints.add(Fingerprint.fromMap(fpMap));
                 } catch (Exception e) {
-                    // Malformed fingerprint entry ignored
+                    // Skip broken (legacy) fingerprint entries; they will be replaced automatically.
                 }
             }
         }
 
         return new Binding(normalizedName, preferredName, accountType, fingerprints, firstSeen, lastSeen, totalPlaytime, trust);
+    }
+
+    private boolean isMigratedDummy(Fingerprint fp) {
+        return "migrated_v2".equals(fp.getClientBrand());
     }
 }
