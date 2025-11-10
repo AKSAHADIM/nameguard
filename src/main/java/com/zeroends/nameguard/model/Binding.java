@@ -9,15 +9,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
 
 /**
  * Represents the identity "binding" for a specific player name.
  * This class links a canonical name to its associated identity proofs.
+ *
+ * V4:
+ *  - serialVersionUID bumped to 4L to reflect added geo signals inside Fingerprint (not strictly required,
+ *    but keeps clarity of evolution).
+ *  - Logic unchanged except comments referencing Fingerprint V4 loading (geo fields optional).
  */
 public class Binding implements Serializable {
 
-    private static final long serialVersionUID = 3L; // Version 3
+    private static final long serialVersionUID = 4L; // Version 4 (Fingerprint geo capable)
 
     // The canonical (normalized) player name
     @NotNull
@@ -47,17 +51,17 @@ public class Binding implements Serializable {
         this.normalizedName = Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
         this.preferredName = Objects.requireNonNull(preferredName, "Preferred name cannot be null");
         this.accountType = Objects.requireNonNull(accountType, "Account type cannot be null");
-        
+
         this.fingerprints = new CopyOnWriteArrayList<>();
         this.fingerprints.add(Objects.requireNonNull(initialFingerprint, "Initial fingerprint cannot be null"));
-        
+
         long now = System.currentTimeMillis();
         this.firstSeen = now;
         this.lastSeen = now;
         this.totalPlaytime = 0;
         this.trust = TrustLevel.LOW; // All new bindings start with low trust
     }
-    
+
     // Private constructor for deserialization from map
     private Binding(@NotNull String normalizedName, @NotNull String preferredName, @NotNull AccountType accountType,
                     @NotNull List<Fingerprint> fingerprints, long firstSeen, long lastSeen,
@@ -189,6 +193,7 @@ public class Binding implements Serializable {
 
     /**
      * Helper method to manually construct a Binding from a Map (like a LinkedHashMap from SnakeYAML).
+     * Uses Fingerprint.fromMap which now supports V4 (geo fields optional).
      * @param normalizedName The key (normalized name) of the binding.
      * @param map The map of values from YAML.
      * @return A new Binding object.
@@ -200,21 +205,20 @@ public class Binding implements Serializable {
         String preferredName = (String) map.get("preferredName");
         AccountType accountType = AccountType.valueOf((String) map.get("accountType"));
         TrustLevel trust = TrustLevel.valueOf((String) map.getOrDefault("trust", "LOW"));
-        
+
         long firstSeen = ((Number) map.getOrDefault("firstSeen", 0L)).longValue();
         long lastSeen = ((Number) map.getOrDefault("lastSeen", 0L)).longValue();
         long totalPlaytime = ((Number) map.getOrDefault("totalPlaytime", 0L)).longValue();
 
         List<Fingerprint> fingerprints = new ArrayList<>();
-        
+
         List<Map<String, Object>> fpData = (List<Map<String, Object>>) map.get("fingerprints");
         if (fpData != null) {
             for (Map<String, Object> fpMap : fpData) {
                 try {
-                    // Use Fingerprint.fromMap to parse V3 structure
                     fingerprints.add(Fingerprint.fromMap(fpMap));
                 } catch (Exception e) {
-                    // Log error or ignore malformed fingerprint
+                    // Malformed fingerprint entry ignored
                 }
             }
         }
