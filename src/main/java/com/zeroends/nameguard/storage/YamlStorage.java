@@ -83,7 +83,9 @@ public class YamlStorage implements IStorage {
         // Serialize fingerprints
         List<Map<String, Object>> fpMapList = new ArrayList<>();
         for (Fingerprint fp : binding.getFingerprints()) {
-            // Manual serialization (to match Fingerprint.fromMap)
+            // Skip dummy migrated_v2 fingerprints from serialization
+            if ("migrated_v2".equals(fp.getClientBrand())) continue;
+
             Map<String, Object> fpMap = new HashMap<>();
             fpMap.put("createdAt", fp.getCreatedAt());
             fpMap.put("xuid", fp.getXuid());
