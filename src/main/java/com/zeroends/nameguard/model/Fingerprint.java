@@ -324,8 +324,7 @@ public final class Fingerprint implements Serializable {
     /**
      * Helper method to manually construct a Fingerprint from a Map (like a LinkedHashMap from SnakeYAML).
      * This handles V2, V3, and V4 format loading.
-     * @param map The map of values from YAML.
-     * @return A new Fingerprint object.
+     * If map format is unknown/legacy, return null and let the binding manager trigger fresh registration on login.
      */
     @NotNull
     @SuppressWarnings("unchecked")
@@ -334,12 +333,8 @@ public final class Fingerprint implements Serializable {
 
         // Handle V1/V2 migration (old hash/GeoIP structure)
         if (map.containsKey("value") || map.containsKey("asn") || map.containsKey("country")) {
-            // Treat old format as invalid/migrated. Force re-registration.
-            return new Fingerprint(
-                    createdAt, null, null, "v4", null, null, null,
-                    "migrated_v2", null, AccountType.JAVA, null,
-                    null, null, null, null, null, null
-            );
+            // Signal error for old/unsupported map, let caller decide to skip/add new.
+            throw new IllegalArgumentException("Legacy fingerprint format detected, skipping/rebinding required.");
         }
 
         // V3/V4 fields
