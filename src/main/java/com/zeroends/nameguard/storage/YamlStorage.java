@@ -2,7 +2,6 @@ package com.zeroends.nameguard.storage;
 
 import com.zeroends.nameguard.model.Binding;
 import com.zeroends.nameguard.model.Fingerprint;
-import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -11,15 +10,16 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 
 /**
- * Implements IStorage using a file-per-player YAML system (V3 Hybrid Model).
+ * Implements IStorage using a file-per-player YAML system (V3/V4 Hybrid Model).
  * Each binding is stored in 'plugins/NameGuard/data/[normalizedName].yml'.
+ *
+ * V4 notes:
+ * - Fingerprint now may include optional Geo-IP signals (countryCode, region, city, asn, org, isp).
+ * - Serialization updated to persist these fields when present.
+ * - Deserialization is handled by Binding.fromMap and Fingerprint.fromMap; missing fields remain backward compatible.
  */
 public class YamlStorage implements IStorage {
 
@@ -48,7 +48,7 @@ public class YamlStorage implements IStorage {
         }
 
         YamlConfiguration yaml = YamlConfiguration.loadConfiguration(playerFile);
-        
+
         try {
             // The root of the YAML file *is* the binding map
             Binding binding = Binding.fromMap(normalizedName, yaml.getValues(false));
@@ -57,6 +57,7 @@ public class YamlStorage implements IStorage {
             logger.error("Failed to parse binding data for {}. File might be corrupt.", normalizedName, e);
             // Rename corrupt file to prevent issues
             File corruptFile = new File(playerFile.getPath() + ".corrupt");
+            // noinspection ResultOfMethodCallIgnored
             playerFile.renameTo(corruptFile);
             return Optional.empty();
         }
@@ -69,9 +70,9 @@ public class YamlStorage implements IStorage {
     @Override
     public void saveBinding(@NotNull Binding binding) throws IOException {
         YamlConfiguration yaml = new YamlConfiguration();
-        
+
         // --- Manual Serialization (to match Binding.fromMap) ---
-        
+
         yaml.set("preferredName", binding.getPreferredName());
         yaml.set("accountType", binding.getAccountType().name());
         yaml.set("trust", binding.getTrust().name());
@@ -95,10 +96,19 @@ public class YamlStorage implements IStorage {
             fpMap.put("protocolVersion", fp.getProtocolVersion());
             fpMap.put("edition", fp.getEdition().name());
             fpMap.put("deviceOs", fp.getDeviceOs());
+
+            // V4: Geo-IP optional fields
+            fpMap.put("countryCode", fp.getCountryCode());
+            fpMap.put("region", fp.getRegion());
+            fpMap.put("city", fp.getCity());
+            fpMap.put("asn", fp.getAsn());
+            fpMap.put("org", fp.getOrg());
+            fpMap.put("isp", fp.getIsp());
+
             fpMapList.add(fpMap);
         }
         yaml.set("fingerprints", fpMapList);
-        
+
         // --- End Manual Serialization ---
 
         File playerFile = getPlayerFile(binding.getNormalizedName());
