@@ -1,6 +1,7 @@
 package com.zeroends.nameguard.util;
 
 import com.zeroends.nameguard.manager.ConfigManager;
+import com.zeroends.nameguard.model.Fingerprint;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -12,6 +13,7 @@ import java.net.InetAddress;
 import java.net.URL;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -157,7 +159,7 @@ public class GeoIpUtil {
      */
     @NotNull
     private Map<String, String> extractFields(@NotNull String json) {
-        Map<String, String> map = new java.util.LinkedHashMap<>();
+        Map<String, String> map = new LinkedHashMap<>();
 
         // Helper lambda untuk ambil nilai string dari JSON single-line (tidak robust penuh, tapi cukup aman untuk format ipwho.is)
         java.util.function.Function<String, String> getVal = (key) -> {
