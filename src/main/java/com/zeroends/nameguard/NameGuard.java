@@ -7,17 +7,24 @@ import com.zeroends.nameguard.manager.ConfigManager;
 import com.zeroends.nameguard.manager.FingerprintManager;
 import com.zeroends.nameguard.storage.IStorage;
 import com.zeroends.nameguard.storage.YamlStorage;
+import com.zeroends.nameguard.util.GeoIpUtil;
 import com.zeroends.nameguard.util.NormalizationUtil;
 import com.zeroends.nameguard.util.IpHeuristicUtil;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.geysermc.floodgate.api.FloodgateApi;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Main plugin entry point.
+ *
+ * V4 Changes:
+ *  - Integrates GeoIpUtil (ipwho.is) for optional geo signals (country, city/region, ASN, org, isp).
+ *  - Passes GeoIpUtil into FingerprintManager constructor.
+ */
 public final class NameGuard extends JavaPlugin {
 
     private ConfigManager configManager;
@@ -26,6 +33,7 @@ public final class NameGuard extends JavaPlugin {
     private FingerprintManager fingerprintManager;
     private NormalizationUtil normalizationUtil;
     private IpHeuristicUtil ipHeuristicUtil;
+    private GeoIpUtil geoIpUtil;
     private FloodgateApi floodgateApi;
 
     // Concurrency lock map for player logins
@@ -40,13 +48,12 @@ public final class NameGuard extends JavaPlugin {
         // 2. Setup Utilities
         this.normalizationUtil = new NormalizationUtil();
         this.ipHeuristicUtil = new IpHeuristicUtil(configManager.getHmacSalt());
-        
-        // 3. Setup Storage (V3 Hybrid Model)
-        // We no longer point to "identities.yml". We point to the root data folder.
-        // YamlStorage will handle the "/data" subdirectory internally.
+        this.geoIpUtil = GeoIpUtil.create(getSLF4JLogger(), configManager);
+
+        // 3. Setup Storage (Hybrid Model: file-per-player)
         try {
             this.storage = new YamlStorage(getDataFolder().toPath(), getSLF4JLogger());
-            this.storage.init(); // This will create the '/data' directory
+            this.storage.init(); // create '/data' directory
         } catch (IOException e) {
             getSLF4JLogger().error("Failed to initialize YAML storage directory. Disabling plugin.", e);
             getServer().getPluginManager().disablePlugin(this);
@@ -54,12 +61,9 @@ public final class NameGuard extends JavaPlugin {
         }
 
         // 4. Setup Managers
-        this.fingerprintManager = new FingerprintManager(this, ipHeuristicUtil);
+        this.fingerprintManager = new FingerprintManager(this, ipHeuristicUtil, geoIpUtil);
         this.bindingManager = new BindingManager(this, storage, normalizationUtil, fingerprintManager);
-        
-        // REMOVED in Hybrid Model: bindingManager.loadAllBindings();
-        // Bindings will be loaded on demand when players join.
-        
+
         // 5. Setup Hooks (Floodgate)
         if (getServer().getPluginManager().isPluginEnabled("Floodgate")) {
             try {
@@ -78,7 +82,7 @@ public final class NameGuard extends JavaPlugin {
         getServer().getPluginManager().registerEvents(new PlayerConnectionListener(this), this);
         Objects.requireNonNull(getCommand("nameguard")).setExecutor(new NameGuardCommand(this));
 
-        getSLF4JLogger().info("NameGuard (Hybrid Storage) has been enabled successfully.");
+        getSLF4JLogger().info("NameGuard v4 (Geo + Strict Gating) has been enabled successfully.");
     }
 
     @Override
@@ -88,7 +92,7 @@ public final class NameGuard extends JavaPlugin {
             bindingManager.saveCacheToDisk();
         }
         loginLocks.clear();
-        
+
         getSLF4JLogger().info("NameGuard has been disabled.");
     }
 
@@ -107,9 +111,13 @@ public final class NameGuard extends JavaPlugin {
     public NormalizationUtil getNormalizationUtil() {
         return normalizationUtil;
     }
-    
+
     public IpHeuristicUtil getIpHeuristicUtil() {
         return ipHeuristicUtil;
+    }
+
+    public GeoIpUtil getGeoIpUtil() {
+        return geoIpUtil;
     }
 
     public Optional<FloodgateApi> getFloodgateApi() {
