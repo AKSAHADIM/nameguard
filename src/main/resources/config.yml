@@ -1,64 +1,78 @@
 # NameGuard Configuration File
-# version: 3.1 (Heuristic Scoring + Strict Network Gating)
+# version: 4.0 (Heuristic Scoring + Strict Network Gating + Optional Geo-IP Enhancements)
+#
+# Catatan:
+# - Versi 4 menambah sinyal Geo (countryCode, city/region, ASN/ORG/ISP) yang diambil via ipwho.is (tanpa akun).
+# - Jika Anda MATIKAN geo.enabled, plugin akan mengabaikan sinyal geo dan tetap bekerja normal.
+# - Pastikan mengganti security.salt dengan nilai acak panjang untuk produksi.
 
-# --- Kebijakan Verifikasi (Verification Policy) ---
 verification:
-  # Jika true, pemain Bedrock tidak bisa memakai nama yang sudah di-bind oleh Java,
-  # dan pemain Java tidak bisa memakai nama yang sudah di-bind oleh Bedrock.
+  # Jika true, pemain Bedrock tidak bisa memakai nama yang sudah di-bind oleh Java, dan sebaliknya.
   crossEditionLock: true
 
   # Jumlah maksimum fingerprint yang disimpan per pemain (rolling window).
-  # 5-10 direkomendasikan.
   rollingFpLimit: 5
 
-  # Durasi (dalam hari) sebelum fingerprint lama yang tidak terpakai dihapus.
-  # 0 untuk menonaktifkan.
+  # Berapa hari fingerprint lama yang tidak dipakai akan dihapus. 0 = nonaktif.
   fingerprintPurgeDays: 90
 
-  # --- Mode Strict (Baru) ---
-  # Bagian ini menambahkan aturan ekstra agar login dari jaringan benar-benar berbeda tidak langsung lolos.
+  # --- Strict Network Gating ---
   strict:
-    # Jika true: Dibutuhkan minimal kecocokan sinyal jaringan (prefix/ASN/PTR) untuk hard allow.
-    # Jika false: Skor bisa hard allow hanya dari sinyal klien (lebih longgar).
+    # Jika true: minimal harus ada overlap sinyal jaringan untuk eligible hard allow.
     requireNetworkOverlap: true
 
-    # Minimum jumlah sinyal jaringan yang cocok (0..3) agar eligible mendapat hard_allow.
-    # Jika < nilai ini maka skor akan diturunkan (dipaksa di bawah hard_allow).
+    # Minimum jumlah sinyal jaringan (prefix / pseudoASN / PTR) yang cocok agar bisa hard allow.
     minNetworkMatchesForHardAllow: 1
 
-    # Jika true: binding dengan trust HIGH atau LOCKED boleh hard allow meski 0 network match.
-    # Jika false: tetap memerlukan setidaknya 1 network match.
-    allowZeroNetworkForTrustHigh: false
+    # Jika true: binding dengan trust HIGH atau LOCKED boleh di-soft allow walau 0 network match (no-learn).
+    allowZeroNetworkForTrustHigh: true
 
-  # --- Pengaturan Skoring Heuristik (Heuristic Scoring) ---
-  # Re-balanced untuk mencegah client-only hard allow.
+    # (Opsional masa depan) aksi jika zero-overlap untuk trust rendah (belum dipakai penuh):
+    # zeroOverlapAction: soft_nolearn   # pilihan rencana: deny | stepup | soft_nolearn
+
+  # --- Pengaturan Skoring (Disarankan Rebalance) ---
   similarity:
-    # Skor minimal untuk diizinkan masuk tanpa peringatan (hard allow).
+    # Skor minimal untuk hard allow (tanpa peringatan).
     hard_allow: 78
-
-    # Skor minimal untuk diizinkan masuk tetapi fingerprint baru akan dipelajari (soft allow).
+    # Skor minimal untuk soft allow (diizinkan + bisa belajar fingerprint baru).
     soft_allow: 45
 
-    # Jika skor < soft_allow, login akan DITOLAK.
-
-  # Bobot skor untuk setiap sinyal.
+  # Bobot sinyal (semakin tinggi semakin berpengaruh). Rebalance agar jaringan lebih dominan.
   weights:
-    # Sinyal non-jaringan (Client / Identity)
+    # Sinyal klien / identitas
     deviceos_weight: 20
     brand_weight: 15
     edition_weight: 10
 
-    # Sinyal jaringan (Heuristik) – dinaikkan agar faktor lokasi / provider berpengaruh
+    # Sinyal jaringan (hashed & privat)
     subnet_weight: 25
     pseudo_asn_weight: 12
     ptr_domain_weight: 8
     ip_version_weight: 5
 
-# --- Keamanan (Security) ---
+  # --- Geo (Sinyal Lokasi & ASN Nyata) ---
+  # Diambil dari ipwho.is (tanpa akun). Plugin melakukan HTTP GET sekali per IP (cache panjang).
+  geo:
+    enabled: true
+    # Timeout request (ms). Jika lewat batas ini atau gagal, sinyal geo dilewati (fallback aman).
+    requestTimeoutMillis: 1200
+    # TTL cache (menit) untuk hasil ipwho.is → menghindari spam API & menjaga performa.
+    cacheTtlMinutes: 720   # 12 jam
+
+    weights:
+      country_weight: 18
+      asn_weight: 12
+      city_weight: 6   # Bisa dipakai sebagai region jika city kurang akurat
+
+    policy:
+      # Jika true dan tidak ada fingerprint lama dengan country sama, kandidat tidak boleh hard allow (turunkan ke soft/no-learn).
+      disallowHardAllowOnCountryMismatch: true
+      # Jika true, binding trust HIGH/LOCKED boleh tetap soft allow walau country mismatch (tidak belajar fingerprint).
+      allowCountryMismatchForTrustHigh: true
+
 security:
   # SALT UNTUK HMAC-SHA256
   # GANTI INI DENGAN STRING ACAK YANG PANJANG DAN RAHASIA!
-  # Mengubah salt akan membuat semua fingerprint jaringan lama menjadi tidak valid (efek: forced re-verification).
   salt: "vWLTFPtdyYbqLMgFuqt2DecUjb1UP4ZT"
 
   # Pesan umum kick (placeholder {reason} akan diganti).
@@ -72,17 +86,26 @@ security:
     confusableName: "Nama Anda terlalu mirip dengan nama yang sudah dilindungi."
     internalError: "Terjadi error internal saat verifikasi."
 
-  # Rate limiter untuk percobaan gagal per IP.
+  # Rate limiter percobaan gagal per IP.
   rateLimit:
     enabled: true
     attempts: 5
     blockDurationSeconds: 300 # 5 menit
 
-# --- Pesan (Messages) ---
 messages:
   protectionSuccess: "§a[NameGuard] Identitas namamu sekarang dilindungi. Perubahan ekstrem pada jaringan dapat memicu verifikasi ulang."
   adminMismatchNotify: "§c[NameGuard] &ePemain {player} §cdiblokir (HARD_MISMATCH). Jika ini pemain asli, periksa jaringan atau gunakan §f/ng bind {player}"
 
-# --- Debug ---
+ownership:
+  # (Placeholder untuk fitur ke depan) Masa 'grace' takeover dalam menit.
+  takeoverGracePeriodMinutes: 1440
+  lowTrustPlaytimeMinutes: 15
+
 debug:
   logFailedAttempts: true
+
+# Penjelasan singkat bobot & kebijakan:
+# - Tanpa 1 network match, skor client-only biasanya < hard_allow (karena bobot jaringan tinggi).
+# - Country match memperkuat toleransi saat pemain ganti provider di negara sama.
+# - Country mismatch menurunkan kemungkinan hard allow untuk mencegah pencurian lintas negara.
+# - TRUST HIGH / LOCKED punya toleransi tambahan (zero network atau country mismatch tetap boleh soft no-learn).
