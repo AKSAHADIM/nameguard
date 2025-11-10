@@ -19,8 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages the core logic of creating, verifying, and persisting identity bindings.
- * This version (V3 Hybrid) uses a file-per-player storage model and an
- * in-memory cache for *online players only*.
+ * Enhanced for Strict Network Gating:
+ *  - Uses FingerprintManager.getSimilarityDetailed() to obtain score + network match count.
+ *  - Applies strict gating rules based on config (require network overlap, min matches for hard allow,
+ *    trust bypass rules).
  */
 public class BindingManager {
 
@@ -29,11 +31,14 @@ public class BindingManager {
     private final NormalizationUtil normalizationUtil;
     private final FingerprintManager fingerprintManager;
     private final ConfigManager configManager;
-    
+
     // This cache now only holds bindings for players *currently online*
     private final Map<String, Object> bindingCache = new ConcurrentHashMap<>();
 
-    public BindingManager(NameGuard plugin, IStorage storage, NormalizationUtil normalizationUtil, FingerprintManager fingerprintManager) {
+    public BindingManager(NameGuard plugin,
+                          IStorage storage,
+                          NormalizationUtil normalizationUtil,
+                          FingerprintManager fingerprintManager) {
         this.plugin = plugin;
         this.storage = storage;
         this.normalizationUtil = normalizationUtil;
@@ -48,13 +53,13 @@ public class BindingManager {
     public void saveCacheToDisk() {
         plugin.getSLF4JLogger().info("Saving {} cached bindings to storage...", bindingCache.size());
         long purgeMillis = configManager.getFingerprintPurgeMillis();
-        
+
         for (Object obj : bindingCache.values()) {
             if (obj instanceof Binding binding) {
                 try {
                     // Auto-purge old fingerprints before saving
                     if (purgeMillis > 0) {
-                        binding.purgeOldFingerprints(purgeMillis, 1); // Selalu simpan minimal 1
+                        binding.purgeOldFingerprints(purgeMillis, 1); // Always keep at least 1
                     }
                     storage.saveBinding(binding);
                 } catch (IOException e) {
@@ -76,89 +81,179 @@ public class BindingManager {
         String originalName = event.getName();
         String normalizedName = normalizationUtil.normalizeName(originalName);
 
-        // Wrap logic in try-catch as getBinding() now performs I/O
         try {
             // 1. Create the new multi-factor fingerprint for this login attempt
             Fingerprint newFingerprint = fingerprintManager.createFingerprint(event);
-            AccountType accountType = newFingerprint.getEdition();
+            AccountType attemptAccountType = newFingerprint.getEdition();
 
             // 2. Get existing binding (from cache or load from disk)
             Optional<Binding> existingBindingOpt = getBinding(normalizedName);
 
             if (existingBindingOpt.isPresent()) {
-                // --- KASUS: Nama sudah ada (Verifikasi) ---
+                // --- EXISTING NAME (Verification Path) ---
                 Binding binding = existingBindingOpt.get();
                 binding.updateLastSeen();
 
-                // Kasus 10: Spoof via casing/confusable
+                // Spoof via casing/confusable attempt
                 if (!binding.getPreferredName().equals(originalName)) {
-                    plugin.getSLF4JLogger().warn("Login denied for '{}' (normalized: {}): Attempted to use confusable name (real: {}).",
-                            originalName, normalizedName, binding.getPreferredName());
+                    plugin.getSLF4JLogger().warn(
+                            "Login denied for '{}' (normalized: {}): confusable spoof (expected display '{}').",
+                            originalName, normalizedName, binding.getPreferredName()
+                    );
                     return new LoginResult.Denied(
                             LoginResult.Reason.CONFUSABLE_NAME_SPOOF,
                             configManager.getKickMessage("confusableName")
                     );
                 }
-                
-                // Kasus 4 & 5: Cek Cross-Edition Lock
-                if (configManager.isCrossEditionLock() && binding.getAccountType() != accountType) {
-                    plugin.getSLF4JLogger().warn("Login denied for '{}': Cross-edition lock active (Binding: {}, Attempt: {}).",
-                            originalName, binding.getAccountType(), accountType);
+
+                // Cross edition lock
+                if (configManager.isCrossEditionLock() && binding.getAccountType() != attemptAccountType) {
+                    plugin.getSLF4JLogger().warn(
+                            "Login denied for '{}': crossEditionLock active (binding: {}, attempt: {}).",
+                            originalName, binding.getAccountType(), attemptAccountType
+                    );
                     return new LoginResult.Denied(
                             LoginResult.Reason.CROSS_EDITION_LOCK,
                             configManager.getKickMessage("crossEditionLock")
                     );
                 }
 
-                // --- Logika Skoring Multi-Faktor Baru ---
-                double maxScore = 0.0;
+                // --- Similarity Scoring with detailed network match accounting ---
+                double maxScore = -1;
+                int bestNetworkMatches = 0;
+                boolean strongIdentityOverride = false;
+                boolean strongIdentityConflict = false;
+
                 for (Fingerprint oldFp : binding.getFingerprints()) {
-                    double score = fingerprintManager.getSimilarity(newFingerprint, oldFp);
-                    if (score > maxScore) {
-                        maxScore = score;
+                    FingerprintManager.SimilarityResult result =
+                            fingerprintManager.getSimilarityDetailed(newFingerprint, oldFp);
+
+                    if (result.strongIdentityConflict()) {
+                        // Immediate denial due to conflicting strong identity (Bedrock XUID mismatch)
+                        plugin.getSLF4JLogger().warn(
+                                "Login denied for '{}': strong identity conflict (XUID mismatch).",
+                                originalName
+                        );
+                        return new LoginResult.Denied(
+                                LoginResult.Reason.HARD_MISMATCH,
+                                configManager.getKickMessage("hardMismatch")
+                        );
+                    }
+
+                    if (result.score() > maxScore) {
+                        maxScore = result.score();
+                        bestNetworkMatches = result.networkMatches();
+                        strongIdentityOverride = result.strongIdentityOverride();
                     }
                 }
 
-                // 1. Hard Allow
-                if (maxScore >= configManager.getScoreHardAllow()) {
+                // --- Strict Gating Logic ---
+                boolean requireOverlap = configManager.isStrictRequireNetworkOverlap();
+                int minMatchesForHardAllow = configManager.getStrictMinNetworkMatchesForHardAllow();
+                boolean allowZeroForTrustHigh = configManager.isStrictAllowZeroNetworkForTrustHigh();
+                Binding.TrustLevel trust = binding.getTrust();
+
+                // If we have a strong identity (Bedrock XUID match), bypass gating
+                if (strongIdentityOverride) {
+                    plugin.getSLF4JLogger().info(
+                            "Hard allow (strong identity override) for '{}' (XUID match, networkMatches={}).",
+                            originalName, bestNetworkMatches
+                    );
                     return new LoginResult.Allowed(binding, false, false);
                 }
 
-                // 2. Soft Allow (Auto-Learning)
+                // Determine if trust qualifies for zero-network-match bypass
+                boolean trustBypass = allowZeroForTrustHigh &&
+                        (trust == Binding.TrustLevel.HIGH || trust == Binding.TrustLevel.LOCKED);
+
+                // Apply gating BEFORE classification into hard/soft/deny
+                boolean networkEligibleForHard =
+                        (!requireOverlap) ||
+                        (bestNetworkMatches >= minMatchesForHardAllow) ||
+                        trustBypass;
+
+                if (!networkEligibleForHard) {
+                    // Not eligible for hard allow. If score would have been >= hardAllow, force downgrade.
+                    if (maxScore >= configManager.getScoreHardAllow()) {
+                        plugin.getSLF4JLogger().info(
+                                "Downgrading potential HARD_ALLOW for '{}' due to insufficient network matches (matches={}, minRequired={}, trustBypass={}).",
+                                originalName, bestNetworkMatches, minMatchesForHardAllow, trustBypass
+                        );
+                        // Force treat as soft or deny by setting maxScore just below hard threshold
+                        maxScore = configManager.getScoreHardAllow() - 1;
+                    }
+                }
+
+                // Optional gating for soft allow: if absolutely zero network matches and not bypassed, deny.
+                if (requireOverlap && bestNetworkMatches == 0 && !trustBypass) {
+                    if (maxScore >= configManager.getScoreSoftAllow()) {
+                        plugin.getSLF4JLogger().info(
+                                "Rejecting SOFT_ALLOW for '{}' due to zero network overlap (score={}, softAllow={}, trustBypass={}).",
+                                originalName, maxScore, configManager.getScoreSoftAllow(), trustBypass
+                        );
+                        // Force below soft allow
+                        maxScore = configManager.getScoreSoftAllow() - 1;
+                    }
+                }
+
+                // --- Classification after gating adjustments ---
+
+                if (maxScore >= configManager.getScoreHardAllow()) {
+                    plugin.getSLF4JLogger().info(
+                            "Hard allow for '{}' (score={}, networkMatches={}, trust={}, overlapRequired={}, minNeeded={}).",
+                            originalName, maxScore, bestNetworkMatches, trust, requireOverlap, minMatchesForHardAllow
+                    );
+                    return new LoginResult.Allowed(binding, false, false);
+                }
+
                 if (maxScore >= configManager.getScoreSoftAllow()) {
+                    // Auto-learning: add new fingerprint if rolling limit not exceeded
                     binding.addFingerprint(newFingerprint, configManager.getRollingFpLimit());
-                    saveBinding(binding); // Async save
+                    saveBinding(binding); // Persist updated binding
+                    plugin.getSLF4JLogger().info(
+                            "Soft allow for '{}' (score={}, networkMatches={}, trust={}, learned fingerprint).",
+                            originalName, maxScore, bestNetworkMatches, trust
+                    );
                     return new LoginResult.Allowed(binding, false, true);
                 }
 
-                // 3. Deny
-                plugin.getSLF4JLogger().warn("Login denied for '{}': Hard fingerprint mismatch (Max Score: {} < Threshold: {}).",
-                        originalName, maxScore, configManager.getScoreSoftAllow());
-                
-                String adminMsgRaw = configManager.getPlugin().getConfig().getString("messages.adminMismatchNotify", "");
+                // Deny (Hard mismatch)
+                plugin.getSLF4JLogger().warn(
+                        "Login denied for '{}': mismatch (score={}, softAllow={}, networkMatches={}, trust={}, overlapRequired={}).",
+                        originalName, maxScore, configManager.getScoreSoftAllow(), bestNetworkMatches, trust, requireOverlap
+                );
+
+                String adminMsgRaw = configManager.getPlugin().getConfig()
+                        .getString("messages.adminMismatchNotify", "");
                 if (adminMsgRaw != null && !adminMsgRaw.isEmpty()) {
                     Component adminMsg = Component.text(adminMsgRaw.replace("{player}", originalName));
                     plugin.getServer().broadcast(adminMsg, "nameguard.admin");
                 }
-                
+
                 return new LoginResult.Denied(
                         LoginResult.Reason.HARD_MISMATCH,
                         configManager.getKickMessage("hardMismatch")
                 );
 
             } else {
-                // --- KASUS: Nama baru (Reservasi) ---
-                plugin.getSLF4JLogger().info("Creating new binding for '{}' (Type: {}).", originalName, accountType);
-                Binding newBinding = new Binding(normalizedName, originalName, accountType, newFingerprint);
-                
-                // Simpan binding baru ke disk dan cache
+                // --- NEW NAME (Reservation Path) ---
+                plugin.getSLF4JLogger().info(
+                        "Creating new binding for '{}' (edition={}, normalized={}).",
+                        originalName, attemptAccountType, normalizedName
+                );
+                Binding newBinding = new Binding(normalizedName, originalName, attemptAccountType, newFingerprint);
                 saveBinding(newBinding);
-                
                 return new LoginResult.Allowed(newBinding, true, false);
             }
-        
+
         } catch (IOException e) {
             plugin.getSLF4JLogger().error("I/O error during login verification for {}", event.getName(), e);
+            return new LoginResult.Denied(
+                    LoginResult.Reason.INTERNAL_ERROR,
+                    configManager.getKickMessage("internalError")
+            );
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().error("Unexpected error during verification for {}", event.getName(), e);
             return new LoginResult.Denied(
                     LoginResult.Reason.INTERNAL_ERROR,
                     configManager.getKickMessage("internalError")
@@ -167,54 +262,48 @@ public class BindingManager {
     }
 
     /**
-     * Gets a Binding. This is the core "load-on-demand" function.
-     * 1. Check in-memory cache (RAM).
-     * 2. If not in cache, try loading from storage (Disk).
-     * 3. If loaded from Disk, add to cache.
+     * Gets a Binding. Load-on-demand:
+     * 1. Check RAM cache.
+     * 2. Load from storage if absent.
+     * 3. Convert legacy map structures if needed.
      *
      * @param normalizedName The normalized name to search for.
-     * @return An Optional containing the Binding if found.
-     * @throws IOException If disk I/O fails during loading.
+     * @return Optional binding.
+     * @throws IOException If disk I/O fails.
      */
     @NotNull
     @SuppressWarnings("unchecked")
     public Optional<Binding> getBinding(@NotNull String normalizedName) throws IOException {
         Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
-        
-        // 1. Check RAM Cache
+
         Object data = bindingCache.get(normalizedName);
 
         if (data == null) {
-            // 2. Not in RAM, try loading from Disk
             Optional<Binding> diskBinding = storage.loadBinding(normalizedName);
-            
             if (diskBinding.isPresent()) {
-                // 2a. Found on disk. Add to RAM cache.
                 bindingCache.put(normalizedName, diskBinding.get());
                 return diskBinding;
-            } else {
-                // 2b. Not on disk. Does not exist.
+            }
+            return Optional.empty();
+        }
+
+        // Failsafe for legacy raw map entry
+        if (data instanceof Map) {
+            plugin.getSLF4JLogger().warn("Found raw Map in cache for '{}'. Converting...", normalizedName);
+            try {
+                Binding convertedBinding = Binding.fromMap(normalizedName, (Map<String, Object>) data);
+                bindingCache.put(normalizedName, convertedBinding);
+                return Optional.of(convertedBinding);
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().error(
+                        "Failed to convert raw Map to Binding for '{}'. Data corrupt - removing.",
+                        normalizedName, e
+                );
+                bindingCache.remove(normalizedName);
                 return Optional.empty();
             }
         }
 
-        // 3. Found in RAM. Handle failsafe and return.
-        
-        // FIX: Failsafe for ClassCastException (from old code, still useful)
-        if (data instanceof Map) {
-            plugin.getSLF4JLogger().warn("Found raw Map in cache for '{}'. Converting on-the-fly.", normalizedName);
-            try {
-                Binding convertedBinding = Binding.fromMap(normalizedName, (Map<String, Object>) data);
-                bindingCache.put(normalizedName, convertedBinding); // Fix the cache
-                return Optional.of(convertedBinding);
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().error("Failed to convert raw Map to Binding for '{}'. Data is corrupt.", normalizedName, e);
-                bindingCache.remove(normalizedName); // Remove corrupt data
-                return Optional.empty();
-            }
-        }
-        
-        // It's already a Binding object
         return Optional.of((Binding) data);
     }
 
@@ -233,66 +322,51 @@ public class BindingManager {
     }
 
     /**
-     * Saves the final state of a binding to disk, then removes it from the 
-     * in-memory cache (RAM). Called on player quit.
-     *
-     * @param normalizedName The player to unload from the session cache.
+     * Saves final state then removes from in-memory cache (called on quit).
+     * @param normalizedName Player normalized name.
      */
     public void unloadBinding(@NotNull String normalizedName) {
         Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
         Object data = bindingCache.get(normalizedName);
-        
+
         if (data instanceof Binding binding) {
             try {
-                // Save final state (playtime, lastSeen, etc.) to disk
                 storage.saveBinding(binding);
             } catch (IOException e) {
                 plugin.getSLF4JLogger().error("Failed to save binding on unload for: {}", normalizedName, e);
             }
-            
-            // Remove from RAM cache
             bindingCache.remove(normalizedName);
         }
     }
 
     /**
-     * Removes a binding from both the cache (RAM) and storage (Disk).
-     * Used by /ng unbind command.
+     * Removes a binding from cache and storage (/ng unbind).
+     * @param normalizedName The normalized name.
+     * @return true if removed (either from cache or disk), false if error.
      */
     public boolean removeBinding(@NotNull String normalizedName) {
         Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
-        if (bindingCache.remove(normalizedName) != null) {
-            try {
-                storage.removeBinding(normalizedName);
-                return true;
-            } catch (IOException e) {
-                plugin.getSLF4JLogger().error("Failed to remove binding for: {}", normalizedName, e);
-                return false;
-            }
-        } else {
-            // Not in cache, but might be on disk (e.g., offline player)
-            try {
-                storage.removeBinding(normalizedName); // Try deleting from disk anyway
-                return true; // Assume success if no I/O error
-            } catch (IOException e) {
-                plugin.getSLF4JLogger().error("Failed to remove binding from disk for: {}", normalizedName, e);
-                return false;
-            }
+        boolean inCache = bindingCache.remove(normalizedName) != null;
+        try {
+            storage.removeBinding(normalizedName);
+            return true;
+        } catch (IOException e) {
+            plugin.getSLF4JLogger().error("Failed to remove binding for: {}", normalizedName, e);
+            // If it was in cache but disk removal failed, treat as failure
+            return false;
         }
     }
-    
+
     /**
-     * Reloads the in-memory cache from storage.
-     * In V3 Hybrid, this just saves and clears the cache.
+     * Reload logic for hybrid model: flush & clear cache.
      */
     public void reloadBindings() {
-        this.saveCacheToDisk();
-        this.bindingCache.clear();
+        saveCacheToDisk();
+        bindingCache.clear();
     }
-    
+
     /**
-     * Returns the internal binding cache (online players only).
-     * @return The map of bindings.
+     * Returns internal binding cache (online players only).
      */
     @NotNull
     public Map<String, Object> getBindingCache() {
