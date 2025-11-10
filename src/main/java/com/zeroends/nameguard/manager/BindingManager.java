@@ -19,10 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages the core logic of creating, verifying, and persisting identity bindings.
- * Patch Additions:
- *  - Mengizinkan variasi prefix Floodgate (".Nama") untuk tidak dianggap spoof
- *    jika satu-satunya perbedaan adalah prefix titik.
- *  - Saat membuat binding baru, preferredName disimpan TANPA prefix leading "." agar konsisten.
+ * PATCH: Always flush new fingerprint to disk immediately after soft/hard allow and always reload binding from disk on login verification.
  */
 public class BindingManager {
 
@@ -32,7 +29,6 @@ public class BindingManager {
     private final FingerprintManager fingerprintManager;
     private final ConfigManager configManager;
 
-    // Cache binding pemain online
     private final Map<String, Object> bindingCache = new ConcurrentHashMap<>();
 
     public BindingManager(NameGuard plugin,
@@ -70,20 +66,29 @@ public class BindingManager {
         String originalName = event.getName();
         String normalizedName = normalizationUtil.normalizeName(originalName);
 
-        // Display name yang disimpan pada binding sebaiknya tanpa prefix "." agar stabil.
+        // Always reload from disk for the latest data!
+        Binding binding = null;
+        try {
+            Optional<Binding> fromDisk = storage.loadBinding(normalizedName);
+            if (fromDisk.isPresent()) {
+                bindingCache.put(normalizedName, fromDisk.get());
+                binding = fromDisk.get();
+            } else {
+                bindingCache.remove(normalizedName);
+            }
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().error("I/O error when loading binding from disk for {}", normalizedName, e);
+        }
+
         String displayAttemptStripped = stripLegacyPrefix(originalName);
 
         try {
             Fingerprint newFingerprint = fingerprintManager.createFingerprint(event);
             AccountType attemptAccountType = newFingerprint.getEdition();
 
-            Optional<Binding> existingBindingOpt = getBinding(normalizedName);
-
-            if (existingBindingOpt.isPresent()) {
-                Binding binding = existingBindingOpt.get();
+            if (binding != null) {
                 binding.updateLastSeen();
 
-                // Cek spoof hanya bila selisihnya bukan sekedar prefix legacy.
                 if (!equalsIgnoringLegacyPrefix(binding.getPreferredName(), originalName)) {
                     plugin.getSLF4JLogger().warn(
                             "Login denied for '{}' (normalized: {}): confusable spoof (expected display '{}').",
@@ -142,6 +147,7 @@ public class BindingManager {
                             "Hard allow (strong identity override) for '{}' (networkMatches={}).",
                             originalName, bestNetworkMatches
                     );
+                    saveBinding(binding); // Persist to disk for every allow
                     return new LoginResult.Allowed(binding, false, false);
                 }
 
@@ -169,7 +175,6 @@ public class BindingManager {
                     maxScore = configManager.getScoreSoftAllow() - 1;
                 }
 
-                // Geo policy gating (country mismatch) dilakukan di versi sebelumnya (jika diaktifkan)
                 if (configManager.isGeoEnabled() && configManager.isGeoDisallowHardAllowOnCountryMismatch()) {
                     boolean anyCountryMatch = false;
                     String newCountry = newFingerprint.getCountryCode();
@@ -199,17 +204,17 @@ public class BindingManager {
                             "Hard allow for '{}' (score={}, networkMatches={}, trust={}).",
                             originalName, maxScore, bestNetworkMatches, trust
                     );
-                    // Jika preferredName masih mengandung prefix, normalkan ke versi tanpa prefix untuk konsistensi
                     String preferred = binding.getPreferredName();
                     if (!preferred.equals(stripLegacyPrefix(preferred))) {
                         binding.setPreferredName(stripLegacyPrefix(preferred));
                     }
+                    saveBinding(binding);
                     return new LoginResult.Allowed(binding, false, false);
                 }
 
                 if (maxScore >= configManager.getScoreSoftAllow()) {
                     binding.addFingerprint(newFingerprint, configManager.getRollingFpLimit());
-                    saveBinding(binding);
+                    saveBinding(binding); // IMMEDIATELY persist fingerprint addition so it's not lost on quit/disconnect!
                     plugin.getSLF4JLogger().info(
                             "Soft allow for '{}' (score={}, networkMatches={}, trust={}, learned fingerprint).",
                             originalName, maxScore, bestNetworkMatches, trust
@@ -268,7 +273,6 @@ public class BindingManager {
     }
 
     private String stripLegacyPrefix(String name) {
-        // Hapus satu atau lebih '.' di depan nama
         return name.replaceFirst("^\\.+", "");
     }
 
