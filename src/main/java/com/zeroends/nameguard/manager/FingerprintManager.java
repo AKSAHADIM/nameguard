@@ -3,6 +3,7 @@ package com.zeroends.nameguard.manager;
 import com.zeroends.nameguard.NameGuard;
 import com.zeroends.nameguard.model.AccountType;
 import com.zeroends.nameguard.model.Fingerprint;
+import com.zeroends.nameguard.util.GeoIpUtil;
 import com.zeroends.nameguard.util.IpHeuristicUtil;
 import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
 import org.geysermc.floodgate.api.player.FloodgatePlayer;
@@ -17,20 +18,31 @@ import java.util.concurrent.TimeoutException;
 
 /**
  * Manages the creation and comparison of multi-factor fingerprints.
- * Enhanced (Strict Mode capable) version:
- *  - Adds network match counting (subnet / pseudo ASN / PTR).
- *  - Provides detailed similarity result to allow gating logic in BindingManager.
+ *
+ * V4 Enhancements:
+ *  - Adds optional Geo-IP enrichment (countryCode, region, city, asn, org, isp) via GeoIpUtil.
+ *  - Adds geo-based scoring (country / ASN / city) to similarity calculation.
+ *  - Still keeps network match counting (subnet / pseudo ASN / PTR) for strict gating in BindingManager.
+ *
+ * Design Notes:
+ *  - Geo scoring is additive ONLY; policy-level downgrades (e.g. "disallow hard allow on country mismatch")
+ *    are applied in BindingManager after evaluating all historic fingerprints.
+ *  - Strong identity (XUID) override / conflict logic stays highest precedence.
  */
 public class FingerprintManager {
 
     private final NameGuard plugin;
     private final ConfigManager configManager;
     private final IpHeuristicUtil ipHeuristicUtil;
+    private final GeoIpUtil geoIpUtil; // optional (may be enabled/disabled in config)
 
-    public FingerprintManager(NameGuard plugin, @NotNull IpHeuristicUtil ipHeuristicUtil) {
+    public FingerprintManager(NameGuard plugin,
+                              @NotNull IpHeuristicUtil ipHeuristicUtil,
+                              @NotNull GeoIpUtil geoIpUtil) {
         this.plugin = plugin;
         this.configManager = plugin.getConfigManager();
         this.ipHeuristicUtil = ipHeuristicUtil;
+        this.geoIpUtil = geoIpUtil;
     }
 
     /**
@@ -92,6 +104,10 @@ public class FingerprintManager {
             // Protocol version not available here (needs handshake listener)
         }
 
+        // --- 3. Geo-IP Enrichment (Optional) ---
+        // Safe to call even if disabled; GeoIpUtil will no-op when geo.enabled=false.
+        geoIpUtil.enrichFingerprint(ip, builder);
+
         return builder.build();
     }
 
@@ -113,11 +129,15 @@ public class FingerprintManager {
      *  - Pseudo ASN (hashedPseudoAsn)
      *  - PTR Domain (hashedPtr)
      *
-     * Gating / penalties are NOT enforced here; they are handled by BindingManager
-     * using the returned networkMatches plus trust level and strict config flags.
+     * Geo signals (if enabled) scored additively:
+     *  - Country Code
+     *  - ASN (numeric, plain text from resolver)
+     *  - City (or region) depending on config
+     *
+     * Gating / policy (e.g., disallowHardAllowOnCountryMismatch) is applied in BindingManager.
      *
      * Strong Identity Override:
-     *  - If XUID matches: returns score = (hard_allow + 10), networkMatches computed but irrelevant for allow.
+     *  - If XUID matches: returns score = (hard_allow + 10), networkMatches computed but policy gating is skipped externally.
      *  - If XUID mismatch (both present, different): returns score = 0, networkMatches = 0.
      *
      * @param newFp current login fingerprint
@@ -139,7 +159,7 @@ public class FingerprintManager {
 
         int score = 0;
 
-        // --- 2. Client & Edition Signals (High weight group) ---
+        // --- 2. Client & Edition Signals ---
         if (Objects.equals(newFp.getDeviceOs(), oldFp.getDeviceOs())) {
             score += configManager.getWeightDeviceOs();
         }
@@ -153,7 +173,7 @@ public class FingerprintManager {
             score += configManager.getWeightIpVersion();
         }
 
-        // --- 3. Network Heuristic Signals (Medium weight group) ---
+        // --- 3. Network Heuristic Signals ---
         int networkMatches = 0;
 
         if (Objects.equals(newFp.getHashedPrefix(), oldFp.getHashedPrefix())) {
@@ -169,7 +189,34 @@ public class FingerprintManager {
             networkMatches++;
         }
 
+        // --- 4. Geo Scoring (Optional Additive) ---
+        if (configManager.isGeoEnabled()) {
+            // Country code equality
+            if (isNonEmptyEqual(newFp.getCountryCode(), oldFp.getCountryCode())) {
+                score += configManager.getGeoWeightCountry();
+            }
+            // ASN (raw numeric/string from resolver)
+            if (isNonEmptyEqual(newFp.getAsn(), oldFp.getAsn())) {
+                score += configManager.getGeoWeightAsn();
+            }
+            // City (or region) match
+            boolean cityMatched = isNonEmptyEqual(newFp.getCity(), oldFp.getCity());
+            if (!cityMatched) {
+                // Fallback: if city not available on either side, try region
+                if (isNonEmptyEqual(newFp.getRegion(), oldFp.getRegion())) {
+                    cityMatched = true;
+                }
+            }
+            if (cityMatched) {
+                score += configManager.getGeoWeightCity();
+            }
+        }
+
         return new SimilarityResult(score, networkMatches, false, false);
+    }
+
+    private boolean isNonEmptyEqual(String a, String b) {
+        return a != null && b != null && !a.isEmpty() && !b.isEmpty() && a.equals(b);
     }
 
     /**
