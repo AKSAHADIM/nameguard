@@ -19,10 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages the core logic of creating, verifying, and persisting identity bindings.
- * Enhanced for Strict Network Gating:
- *  - Uses FingerprintManager.getSimilarityDetailed() to obtain score + network match count.
- *  - Applies strict gating rules based on config (require network overlap, min matches for hard allow,
- *    trust bypass rules).
+ * Enhanced for:
+ *  - Strict Network Gating (require overlap for hard allow, optional soft gating).
+ *  - Geo policy gating (optional): disallow hard-allow when country mismatches historical fingerprints,
+ *    with optional bypass for HIGH/LOCKED trust.
  */
 public class BindingManager {
 
@@ -147,7 +147,7 @@ public class BindingManager {
                     }
                 }
 
-                // --- Strict Gating Logic ---
+                // --- Strict Network Gating Logic ---
                 boolean requireOverlap = configManager.isStrictRequireNetworkOverlap();
                 int minMatchesForHardAllow = configManager.getStrictMinNetworkMatchesForHardAllow();
                 boolean allowZeroForTrustHigh = configManager.isStrictAllowZeroNetworkForTrustHigh();
@@ -166,7 +166,7 @@ public class BindingManager {
                 boolean trustBypass = allowZeroForTrustHigh &&
                         (trust == Binding.TrustLevel.HIGH || trust == Binding.TrustLevel.LOCKED);
 
-                // Apply gating BEFORE classification into hard/soft/deny
+                // Apply network gating BEFORE classification into hard/soft/deny
                 boolean networkEligibleForHard =
                         (!requireOverlap) ||
                         (bestNetworkMatches >= minMatchesForHardAllow) ||
@@ -196,12 +196,41 @@ public class BindingManager {
                     }
                 }
 
+                // --- Geo Policy Gating (Optional) ---
+                // Disallow HARD allow when the new attempt's countryCode does not match ANY historical fingerprint's country,
+                // unless bypass allowed for HIGH/LOCKED trust.
+                if (configManager.isGeoEnabled() && configManager.isGeoDisallowHardAllowOnCountryMismatch()) {
+                    boolean anyCountryMatch = false;
+                    String newCountry = newFingerprint.getCountryCode();
+                    if (newCountry != null && !newCountry.isEmpty()) {
+                        for (Fingerprint oldFp : binding.getFingerprints()) {
+                            String oldCountry = oldFp.getCountryCode();
+                            if (oldCountry != null && !oldCountry.isEmpty() && newCountry.equals(oldCountry)) {
+                                anyCountryMatch = true;
+                                break;
+                            }
+                        }
+                    }
+                    boolean geoTrustBypass = configManager.isGeoAllowCountryMismatchForTrustHigh()
+                            && (trust == Binding.TrustLevel.HIGH || trust == Binding.TrustLevel.LOCKED);
+
+                    if (!anyCountryMatch && !geoTrustBypass) {
+                        if (maxScore >= configManager.getScoreHardAllow()) {
+                            plugin.getSLF4JLogger().info(
+                                    "Downgrading potential HARD_ALLOW for '{}' due to country mismatch (newCountry={}, trust={}, allowBypassForHigh={}, hasMatch={}).",
+                                    originalName, newCountry, trust, configManager.isGeoAllowCountryMismatchForTrustHigh(), false
+                            );
+                            maxScore = configManager.getScoreHardAllow() - 1;
+                        }
+                    }
+                }
+
                 // --- Classification after gating adjustments ---
 
                 if (maxScore >= configManager.getScoreHardAllow()) {
                     plugin.getSLF4JLogger().info(
-                            "Hard allow for '{}' (score={}, networkMatches={}, trust={}, overlapRequired={}, minNeeded={}).",
-                            originalName, maxScore, bestNetworkMatches, trust, requireOverlap, minMatchesForHardAllow
+                            "Hard allow for '{}' (score={}, networkMatches={}, trust={}).",
+                            originalName, maxScore, bestNetworkMatches, trust
                     );
                     return new LoginResult.Allowed(binding, false, false);
                 }
