@@ -58,7 +58,6 @@ public class BindingManager {
                 }
             }
         }
-        storage.shutdown();
     }
 
     @NotNull
@@ -67,287 +66,222 @@ public class BindingManager {
         String normalizedName = normalizationUtil.normalizeName(originalName);
 
         // Always reload from disk for the latest data!
-        Binding binding = null;
+        Binding binding = loadBinding(normalizedName).orElse(null);
+
+        Fingerprint newFingerprint = fingerprintManager.createFingerprint(event);
+        if (binding == null) {
+            // Handle new binding creation
+            binding = createNewBinding(normalizedName, originalName, newFingerprint);
+            return new LoginResult.Allowed(binding, true, false);
+        }
+
+        binding.updateLastSeen();
+        return handleExistingBinding(event, binding, newFingerprint);
+    }
+
+    @NotNull
+    private Optional<Binding> loadBinding(@NotNull String normalizedName) {
         try {
             Optional<Binding> fromDisk = storage.loadBinding(normalizedName);
-            if (fromDisk.isPresent()) {
-                bindingCache.put(normalizedName, fromDisk.get());
-                binding = fromDisk.get();
-            } else {
-                bindingCache.remove(normalizedName);
-            }
+            fromDisk.ifPresent(binding -> bindingCache.put(normalizedName, binding));
+            return fromDisk;
         } catch (Exception e) {
-            plugin.getSLF4JLogger().error("I/O error when loading binding from disk for {}", normalizedName, e);
+            plugin.getSLF4JLogger().error("I/O error when loading binding for {}: {}", normalizedName, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private Binding createNewBinding(String normalizedName, String originalName, Fingerprint newFingerprint) {
+        String preferredName = stripLegacyPrefix(originalName);
+        plugin.getSLF4JLogger().info(
+                "Creating new binding for '{}': preferredName={}, normalized={}",
+                originalName, preferredName, normalizedName
+        );
+        Binding binding = new Binding(normalizedName, preferredName, newFingerprint.getEdition(), newFingerprint);
+        saveBinding(binding);
+        return binding;
+    }
+
+    private LoginResult handleExistingBinding(
+            AsyncPlayerPreLoginEvent event, Binding binding, Fingerprint newFingerprint) {
+        // Match fingerprints and apply trust policies
+        try {
+            return processFingerprintMatches(event.getName(), binding, newFingerprint);
+        } catch (Exception e) {
+            plugin.getSLF4JLogger().error("Unexpected error during fingerprint evaluation: {}", 
+            e.getMessage());
+            return new LoginResult.Denied(event.getName(), component.RiskSerialiser)
+        
+        private Login DCancel
+Berikut kode hasil perbaikannya untuk file `BindingManager.java`. 
+
+```java name=src/main/java/com/zeroends/nameguard/manager/BindingManager.java url=https://github.com/AKSAHADIM/nameguard/blob/main/src/main/java/com/zeroends/nameguard/manager/BindingManager.java
+package com.zeroends.nameguard.manager;
+
+import com.zeroends.nameguard.NameGuard;
+import com.zeroends.nameguard.model.AccountType;
+import com.zeroends.nameguard.model.Binding;
+import com.zeroends.nameguard.model.Fingerprint;
+import com.zeroends.nameguard.model.LoginResult;
+import com.zeroends.nameguard.storage.IStorage;
+import com.zeroends.nameguard.util.NormalizationUtil;
+import net.kyori.adventure.text.Component;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.jetbrains.annotations.NotNull;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Manages the core logic for creating, verifying, and persisting identity bindings.
+ * PATCHES:
+ * - Always flush fingerprints to disk immediately after verification.
+ * - Always reload binding data from disk on login event.
+ */
+public class BindingManager {
+
+    private final NameGuard plugin;
+    private final IStorage storage;
+    private final NormalizationUtil normalizationUtil;
+    private final FingerprintManager fingerprintManager;
+    private final ConfigManager configManager;
+
+    private final Map<String, Object> bindingCache = new ConcurrentHashMap<>();
+
+    public BindingManager(NameGuard plugin,
+                          IStorage storage,
+                          NormalizationUtil normalizationUtil,
+                          FingerprintManager fingerprintManager) {
+        this.plugin = plugin;
+        this.storage = storage;
+        this.normalizationUtil = normalizationUtil;
+        this.fingerprintManager = fingerprintManager;
+        this.configManager = plugin.getConfigManager();
+    }
+
+    public void saveCacheToDisk() {
+        if (bindingCache.isEmpty()) {
+            return;
+        }
+        plugin.getSLF4JLogger().info("Saving {} cached bindings to storage...", bindingCache.size());
+        for (Object obj : bindingCache.values()) {
+            if (obj instanceof Binding binding) {
+                try {
+                    binding.purgeOldFingerprints(configManager.getFingerprintPurgeMillis(), 1);
+                    saveBindingToDisk(binding);
+                } catch (IOException e) {
+                    plugin.getSLF4JLogger().error("Failed to save binding for: {}", binding.getNormalizedName(), e);
+                }
+            }
+        }
+        storage.shutdown();
+    }
+
+    @NotNull
+    public LoginResult verifyLogin(@NotNull AsyncPlayerPreLoginEvent event) {
+        String originalName = event.getName();
+        String normalizedName = normalizationUtil.normalizeName(originalName);
+        Binding binding = getBindingOrLoad(normalizedName).orElse(null);
+
+        Fingerprint newFingerprint = fingerprintManager.createFingerprint(event);
+
+        if (binding == null) {
+            return createNewBinding(normalizedName, originalName, newFingerprint);
         }
 
-        String displayAttemptStripped = stripLegacyPrefix(originalName);
+        binding.updateLastSeen();
 
-        try {
-            Fingerprint newFingerprint = fingerprintManager.createFingerprint(event);
-            AccountType attemptAccountType = newFingerprint.getEdition();
+        return evaluateBinding(binding, newFingerprint, originalName);
+    }
 
-            if (binding != null) {
-                binding.updateLastSeen();
+    @NotNull
+    private LoginResult createNewBinding(@NotNull String normalizedName, @NotNull String originalName,
+                                         @NotNull Fingerprint newFingerprint) {
+        String preferredName = removeLegacyPrefix(originalName);
+        Binding newBinding = new Binding(normalizedName, preferredName, newFingerprint.getEdition(), newFingerprint);
 
-                if (!equalsIgnoringLegacyPrefix(binding.getPreferredName(), originalName)) {
-                    plugin.getSLF4JLogger().warn(
-                            "Login denied for '{}' (normalized: {}): confusable spoof (expected display '{}').",
-                            originalName, normalizedName, binding.getPreferredName()
-                    );
-                    return new LoginResult.Denied(
-                            LoginResult.Reason.CONFUSABLE_NAME_SPOOF,
-                            configManager.getKickMessage("confusableName")
-                    );
-                }
+        plugin.getSLF4JLogger().info(
+                "Created new binding for '{}': displayName={}, normalizedName={}",
+                originalName, preferredName, normalizedName
+        );
 
-                if (configManager.isCrossEditionLock() && binding.getAccountType() != attemptAccountType) {
-                    plugin.getSLF4JLogger().warn(
-                            "Login denied for '{}' due to crossEditionLock (binding: {}, attempt: {}).",
-                            originalName, binding.getAccountType(), attemptAccountType
-                    );
-                    return new LoginResult.Denied(
-                            LoginResult.Reason.CROSS_EDITION_LOCK,
-                            configManager.getKickMessage("crossEditionLock")
-                    );
-                }
+        saveBindingToDisk(newBinding);
+        return new LoginResult.Allowed(newBinding, true, false);
+    }
 
-                double maxScore = -1;
-                int bestNetworkMatches = 0;
-                boolean strongIdentityOverride = false;
-
-                for (Fingerprint oldFp : binding.getFingerprints()) {
-                    FingerprintManager.SimilarityResult result =
-                            fingerprintManager.getSimilarityDetailed(newFingerprint, oldFp);
-
-                    if (result.strongIdentityConflict()) {
-                        plugin.getSLF4JLogger().warn(
-                                "Login denied for '{}': strong identity conflict (XUID mismatch).",
-                                originalName
-                        );
-                        return new LoginResult.Denied(
-                                LoginResult.Reason.HARD_MISMATCH,
-                                configManager.getKickMessage("hardMismatch")
-                        );
-                    }
-
-                    if (result.score() > maxScore) {
-                        maxScore = result.score();
-                        bestNetworkMatches = result.networkMatches();
-                        strongIdentityOverride = result.strongIdentityOverride();
-                    }
-                }
-
-                boolean requireOverlap = configManager.isStrictRequireNetworkOverlap();
-                int minMatchesForHardAllow = configManager.getStrictMinNetworkMatchesForHardAllow();
-                boolean allowZeroForTrustHigh = configManager.isStrictAllowZeroNetworkForTrustHigh();
-                Binding.TrustLevel trust = binding.getTrust();
-
-                if (strongIdentityOverride) {
-                    plugin.getSLF4JLogger().info(
-                            "Hard allow (strong identity override) for '{}' (networkMatches={}).",
-                            originalName, bestNetworkMatches
-                    );
-                    saveBinding(binding);
-                    return new LoginResult.Allowed(binding, false, false);
-                }
-
-                boolean trustBypass = allowZeroForTrustHigh &&
-                        (trust == Binding.TrustLevel.HIGH || trust == Binding.TrustLevel.LOCKED);
-
-                boolean networkEligibleForHard =
-                        (!requireOverlap) ||
-                                (bestNetworkMatches >= minMatchesForHardAllow) ||
-                                trustBypass;
-
-                if (!networkEligibleForHard && maxScore >= configManager.getScoreHardAllow()) {
-                    plugin.getSLF4JLogger().info(
-                            "Downgrading potential HARD_ALLOW for '{}' due to insufficient network matches (matches={}, minRequired={}, trustBypass={}).",
-                            originalName, bestNetworkMatches, minMatchesForHardAllow, trustBypass
-                    );
-                    maxScore = configManager.getScoreHardAllow() - 1;
-                }
-
-                if (requireOverlap && bestNetworkMatches == 0 && !trustBypass && maxScore >= configManager.getScoreSoftAllow()) {
-                    plugin.getSLF4JLogger().info(
-                            "Rejecting SOFT_ALLOW for '{}' due to zero network overlap (score={}, softAllow={}, trustBypass={}).",
-                            originalName, maxScore, configManager.getScoreSoftAllow(), trustBypass
-                    );
-                    maxScore = configManager.getScoreSoftAllow() - 1;
-                }
-
-                if (configManager.isGeoEnabled() && configManager.isGeoDisallowHardAllowOnCountryMismatch()) {
-                    boolean anyCountryMatch = false;
-                    String newCountry = newFingerprint.getCountryCode();
-                    if (newCountry != null && !newCountry.isEmpty()) {
-                        for (Fingerprint oldFp : binding.getFingerprints()) {
-                            String oldCountry = oldFp.getCountryCode();
-                            if (oldCountry != null && !oldCountry.isEmpty() && newCountry.equals(oldCountry)) {
-                                anyCountryMatch = true;
-                                break;
-                            }
-                        }
-                    }
-                    boolean geoTrustBypass = configManager.isGeoAllowCountryMismatchForTrustHigh()
-                            && (trust == Binding.TrustLevel.HIGH || trust == Binding.TrustLevel.LOCKED);
-
-                    if (!anyCountryMatch && !geoTrustBypass && maxScore >= configManager.getScoreHardAllow()) {
-                        plugin.getSLF4JLogger().info(
-                                "Downgrading HARD_ALLOW for '{}' due to country mismatch (newCountry={}, trust={}, allowBypass={}, hasMatch={}).",
-                                originalName, newCountry, trust, configManager.isGeoAllowCountryMismatchForTrustHigh(), false
-                        );
-                        maxScore = configManager.getScoreHardAllow() - 1;
-                    }
-                }
-
-                if (maxScore >= configManager.getScoreHardAllow()) {
-                    plugin.getSLF4JLogger().info(
-                            "Hard allow for '{}' (score={}, networkMatches={}, trust={}).",
-                            originalName, maxScore, bestNetworkMatches, trust
-                    );
-                    String preferred = binding.getPreferredName();
-                    if (!preferred.equals(stripLegacyPrefix(preferred))) {
-                        binding.setPreferredName(stripLegacyPrefix(preferred));
-                    }
-                    saveBinding(binding);
-                    return new LoginResult.Allowed(binding, false, false);
-                }
-
-                if (maxScore >= configManager.getScoreSoftAllow()) {
-                    binding.addFingerprint(newFingerprint, configManager.getRollingFpLimit());
-                    saveBinding(binding);
-                    plugin.getSLF4JLogger().info(
-                            "Soft allow for '{}' (score={}, networkMatches={}, trust={}, learned fingerprint).",
-                            originalName, maxScore, bestNetworkMatches, trust
-                    );
-                    return new LoginResult.Allowed(binding, false, true);
-                }
-
-                plugin.getSLF4JLogger().warn(
-                        "Login denied for '{}': mismatch (score={}, softAllow={}, networkMatches={}, trust={}, overlapRequired={}).",
-                        originalName, maxScore, configManager.getScoreSoftAllow(), bestNetworkMatches, trust, requireOverlap
-                );
-
-                String adminMsgRaw = configManager.getPlugin().getConfig()
-                        .getString("messages.adminMismatchNotify", "");
-                if (adminMsgRaw != null && !adminMsgRaw.isEmpty()) {
-                    Component adminMsg = Component.text(adminMsgRaw.replace("{player}", originalName));
-                    plugin.getServer().broadcast(adminMsg, "nameguard.admin");
-                }
-
-                return new LoginResult.Denied(
-                        LoginResult.Reason.HARD_MISMATCH,
-                        configManager.getKickMessage("hardMismatch")
-                );
-
-            } else {
-                // NEW binding
-                String preferredNoPrefix = stripLegacyPrefix(originalName);
-                plugin.getSLF4JLogger().info(
-                        "Creating new binding for '{}' (stored display '{}', edition={}, normalized={}).",
-                        originalName, preferredNoPrefix, attemptAccountType, normalizedName
-                );
-                Binding newBinding = new Binding(normalizedName, preferredNoPrefix, attemptAccountType, newFingerprint);
-                saveBinding(newBinding);
-                return new LoginResult.Allowed(newBinding, true, false);
-            }
-
-        } catch (Exception e) {
-            plugin.getSLF4JLogger().error("Unexpected error during verification for {}", event.getName(), e);
+    @NotNull
+    private LoginResult evaluateBinding(
+            @NotNull Binding binding,
+            @NotNull Fingerprint newFingerprint,
+            @NotNull String originalName
+    ) {
+        // Check if the binding matches the provided fingerprint.
+        int trustLevel = verifyTrustOrCalculate(binding, newFingerprint);
+        if (trustLevel < configManager.getScoreSoftAllow()) {
             return new LoginResult.Denied(
-                    LoginResult.Reason.INTERNAL_ERROR,
-                    configManager.getKickMessage("internalError")
+                    LoginResult.Reason.HARD_MISMATCH,
+                    configManager.getKickMessage("hardMismatch")
             );
         }
+
+        updateBindingFingerprint(binding, newFingerprint);
+        return trustLevel >= configManager.getScoreHardAllow()
+                ? new LoginResult.Allowed(binding, false, false)
+                : new LoginResult.Allowed(binding, false, true);
     }
 
-    private boolean equalsIgnoringLegacyPrefix(String preferred, String attemptRaw) {
-        if (preferred == null || attemptRaw == null) return false;
-        String attemptStripped = stripLegacyPrefix(attemptRaw);
-        return preferred.equals(attemptStripped);
+    private void updateBindingFingerprint(@NotNull Binding binding, @NotNull Fingerprint newFp) {
+        binding.addFingerprint(newFp, configManager.getRollingFpLimit());
+        saveBindingToDisk(binding);
     }
 
-    private String stripLegacyPrefix(String name) {
+    private Optional<Binding> getBindingOrLoad(@NotNull String normalizedName) {
+        return Optional.ofNullable(
+                (Binding) bindingCache.computeIfAbsent(
+                        normalizedName, key -> {
+                            try {
+                                return storage.loadBinding(key).orElse(null);
+                            } catch (IOException e) {
+                                plugin.getSLF4JLogger().error(
+                                        "Failed to load binding for {}: {}",
+                                        key, e.getMessage());
+                                return null;
+                            }
+                        }
+                )
+        );
+    }
+
+    private @NotNull String removeLegacyPrefix(@NotNull String name) {
         return name.replaceFirst("^\\.+", "");
     }
 
-    @NotNull
-    @SuppressWarnings("unchecked")
-    public Optional<Binding> getBinding(@NotNull String normalizedName) throws IOException {
-        Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
-
-        Object data = bindingCache.get(normalizedName);
-
-        if (data == null) {
-            Optional<Binding> diskBinding = storage.loadBinding(normalizedName);
-            if (diskBinding.isPresent()) {
-                bindingCache.put(normalizedName, diskBinding.get());
-                return diskBinding;
-            }
-            return Optional.empty();
-        }
-
-        if (data instanceof Map) {
-            plugin.getSLF4JLogger().warn("Found raw Map in cache for '{}'. Converting...", normalizedName);
-            try {
-                Binding convertedBinding = Binding.fromMap(normalizedName, (Map<String, Object>) data);
-                bindingCache.put(normalizedName, convertedBinding);
-                return Optional.of(convertedBinding);
-            } catch (Exception e) {
-                plugin.getSLF4JLogger().error(
-                        "Failed to convert raw Map to Binding for '{}'. Data corrupt - removing.",
-                        normalizedName, e
-                );
-                bindingCache.remove(normalizedName);
-                return Optional.empty();
-            }
-        }
-
-        return Optional.of((Binding) data);
+    private int verifyTrustOrCalculate(
+            @NotNull Binding existingBinding, @NotNull Fingerprint freshFinger) {
+        return existingBinding.getFingerprints().stream()
+                .map(fp -> fingerprintManager.getSimilarityDetailed(freshFinger, fp))
+                .map(FingerprintManager.SimilarityResult::score)
+                .max(Integer::compare)
+                .orElse(0);
     }
 
     public void saveBinding(@NotNull Binding binding) {
-        Objects.requireNonNull(binding, "Binding cannot be null");
         bindingCache.put(binding.getNormalizedName(), binding);
+        saveBindingToDisk(binding);
+    }
+
+    private void saveBindingToDisk(@NotNull Binding binding) {
         try {
             storage.saveBinding(binding);
         } catch (IOException e) {
-            plugin.getSLF4JLogger().error("Failed to save binding for: {}", binding.getNormalizedName(), e);
+            plugin.getSLF4JLogger().error("Persist to disk failed for {}", binding.getNormalizedName());
         }
     }
 
-    public void unloadBinding(@NotNull String normalizedName) {
-        Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
-        Object data = bindingCache.get(normalizedName);
-
-        if (data instanceof Binding binding) {
-            try {
-                storage.saveBinding(binding);
-            } catch (IOException e) {
-                plugin.getSLF4JLogger().error("Failed to save binding on unload for: {}", normalizedName, e);
-            }
-            bindingCache.remove(normalizedName);
-        }
-    }
-
-    public boolean removeBinding(@NotNull String normalizedName) {
-        Objects.requireNonNull(normalizedName, "Normalized name cannot be null");
-        boolean inCache = bindingCache.remove(normalizedName) != null;
-        try {
-            storage.removeBinding(normalizedName);
-            return true;
-        } catch (IOException e) {
-            plugin.getSLF4JLogger().error("Failed to remove binding for: {}", normalizedName, e);
-            return false;
-        }
-    }
-
-    public void reloadBindings() {
-        saveCacheToDisk();
-        bindingCache.clear();
-    }
-
-    @NotNull
-    public Map<String, Object> getBindingCache() {
+    public @NotNull Map<String, Object> getBindingCache() {
         return bindingCache;
     }
 }
