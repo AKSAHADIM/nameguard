@@ -102,7 +102,7 @@ public class BindingManager {
 
                 if (configManager.isCrossEditionLock() && binding.getAccountType() != attemptAccountType) {
                     plugin.getSLF4JLogger().warn(
-                            "Login denied for '{}': crossEditionLock active (binding: {}, attempt: {}).",
+                            "Login denied for '{}' due to crossEditionLock (binding: {}, attempt: {}).",
                             originalName, binding.getAccountType(), attemptAccountType
                     );
                     return new LoginResult.Denied(
@@ -147,7 +147,7 @@ public class BindingManager {
                             "Hard allow (strong identity override) for '{}' (networkMatches={}).",
                             originalName, bestNetworkMatches
                     );
-                    saveBinding(binding); // Persist to disk for every allow
+                    saveBinding(binding);
                     return new LoginResult.Allowed(binding, false, false);
                 }
 
@@ -214,7 +214,7 @@ public class BindingManager {
 
                 if (maxScore >= configManager.getScoreSoftAllow()) {
                     binding.addFingerprint(newFingerprint, configManager.getRollingFpLimit());
-                    saveBinding(binding); // IMMEDIATELY persist fingerprint addition so it's not lost on quit/disconnect!
+                    saveBinding(binding);
                     plugin.getSLF4JLogger().info(
                             "Soft allow for '{}' (score={}, networkMatches={}, trust={}, learned fingerprint).",
                             originalName, maxScore, bestNetworkMatches, trust
@@ -240,7 +240,7 @@ public class BindingManager {
                 );
 
             } else {
-                // NEW binding: simpan preferredName tanpa prefix agar stabil ke depan.
+                // NEW binding
                 String preferredNoPrefix = stripLegacyPrefix(originalName);
                 plugin.getSLF4JLogger().info(
                         "Creating new binding for '{}' (stored display '{}', edition={}, normalized={}).",
@@ -251,12 +251,6 @@ public class BindingManager {
                 return new LoginResult.Allowed(newBinding, true, false);
             }
 
-        } catch (IOException e) {
-            plugin.getSLF4JLogger().error("I/O error during login verification for {}", event.getName(), e);
-            return new LoginResult.Denied(
-                    LoginResult.Reason.INTERNAL_ERROR,
-                    configManager.getKickMessage("internalError")
-            );
         } catch (Exception e) {
             plugin.getSLF4JLogger().error("Unexpected error during verification for {}", event.getName(), e);
             return new LoginResult.Denied(
