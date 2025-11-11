@@ -1,54 +1,142 @@
 package com.zeroends.nameguard.storage;
 
 import com.zeroends.nameguard.model.Binding;
+import com.zeroends.nameguard.model.Fingerprint;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.jetbrains.annotations.NotNull;
+import org.slf4j.Logger;
 
+import java.io.File;
 import java.io.IOException;
-import java.util.Optional;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
 
 /**
- * Interface for a storage backend that handles persisting and retrieving Bindings.
- * This (V3 Hybrid) interface is designed for loading individual bindings on demand,
- * rather than loading all bindings into memory at once.
+ * Implements IStorage using a file-per-player YAML system (V3/V4 Hybrid Model).
+ * Each binding is stored in 'plugins/NameGuard/data/[normalizedName].yml'.
+ *
+ * V4 notes:
+ * - Fingerprint now may include optional Geo-IP signals (countryCode, region, city, asn, org, isp).
+ * - Serialization updated to persist these fields when present.
+ * - Deserialization is handled by Binding.fromMap and Fingerprint.fromMap; missing fields remain backward compatible.
  */
-public interface IStorage {
+public class YamlStorage implements IStorage {
+
+    private final Path dataDirectory;
+    private final Logger logger;
+
+    public YamlStorage(@NotNull Path pluginDataFolder, @NotNull Logger logger) {
+        this.dataDirectory = pluginDataFolder.resolve("data");
+        this.logger = logger;
+    }
+
+    @Override
+    public void init() throws IOException {
+        // Create the 'data' directory if it doesn't exist
+        Files.createDirectories(dataDirectory);
+    }
 
     /**
-     * Initializes the storage backend (e.g., creates directories).
-     * @throws IOException If initialization fails.
+     * Loads a binding by reading its specific .yml file from the data directory.
      */
-    void init() throws IOException;
+    @Override
+    public Optional<Binding> loadBinding(@NotNull String normalizedName) throws IOException {
+        File playerFile = getPlayerFile(normalizedName);
+        if (!playerFile.exists()) {
+            return Optional.empty();
+        }
+
+        YamlConfiguration yaml = YamlConfiguration.loadConfiguration(playerFile);
+
+        try {
+            // The root of the YAML file *is* the binding map
+            Binding binding = Binding.fromMap(normalizedName, yaml.getValues(false));
+            return Optional.of(binding);
+        } catch (Exception e) {
+            logger.error("Failed to parse binding data for {}. File might be corrupt.", normalizedName, e);
+            // Rename corrupt file to prevent issues
+            File corruptFile = new File(playerFile.getPath() + ".corrupt");
+            // noinspection ResultOfMethodCallIgnored
+            playerFile.renameTo(corruptFile);
+            return Optional.empty();
+        }
+    }
 
     /**
-     * Loads a specific Binding from the storage backend based on the normalized name.
-     * This is expected to perform I/O (e.g., read a file).
-     *
-     * @param normalizedName The normalized name of the player.
-     * @return An Optional<Binding> containing the binding if found, or empty if not.
-     * @throws IOException If a read error occurs.
+     * Saves a binding by writing its data to its specific .yml file.
+     * This will overwrite any existing file.
      */
-    Optional<Binding> loadBinding(@NotNull String normalizedName) throws IOException;
+    @Override
+    public void saveBinding(@NotNull Binding binding) throws IOException {
+        YamlConfiguration yaml = new YamlConfiguration();
+
+        // --- Manual Serialization (to match Binding.fromMap) ---
+
+        yaml.set("preferredName", binding.getPreferredName());
+        yaml.set("accountType", binding.getAccountType().name());
+        yaml.set("trust", binding.getTrust().name());
+        yaml.set("firstSeen", binding.getFirstSeen());
+        yaml.set("lastSeen", binding.getLastSeen());
+        yaml.set("totalPlaytime", binding.getTotalPlaytime());
+
+        // Serialize fingerprints
+        List<Map<String, Object>> fpMapList = new ArrayList<>();
+        for (Fingerprint fp : binding.getFingerprints()) {
+            Map<String, Object> fpMap = new HashMap<>();
+            fpMap.put("createdAt", fp.getCreatedAt());
+            fpMap.put("xuid", fp.getXuid());
+            fpMap.put("javaUuid", fp.getJavaUuid());
+            fpMap.put("ipVersion", fp.getIpVersion());
+            fpMap.put("hashedPrefix", fp.getHashedPrefix());
+            fpMap.put("hashedPtr", fp.getHashedPtr());
+            fpMap.put("hashedPseudoAsn", fp.getHashedPseudoAsn());
+            fpMap.put("clientBrand", fp.getClientBrand());
+            fpMap.put("protocolVersion", fp.getProtocolVersion());
+            fpMap.put("edition", fp.getEdition().name());
+            fpMap.put("deviceOs", fp.getDeviceOs());
+
+            // V4: Geo-IP optional fields
+            fpMap.put("countryCode", fp.getCountryCode());
+            fpMap.put("region", fp.getRegion());
+            fpMap.put("city", fp.getCity());
+            fpMap.put("asn", fp.getAsn());
+            fpMap.put("org", fp.getOrg());
+            fpMap.put("isp", fp.getIsp());
+
+            fpMapList.add(fpMap);
+        }
+        yaml.set("fingerprints", fpMapList);
+
+        // --- End Manual Serialization ---
+
+        File playerFile = getPlayerFile(binding.getNormalizedName());
+        yaml.save(playerFile);
+    }
 
     /**
-     * Saves a specific Binding to the storage backend.
-     * This is expected to perform I/O (e.g., write to a file).
-     *
-     * @param binding The Binding object to save.
-     * @throws IOException If a write error occurs.
+     * Removes a binding by deleting its .yml file.
      */
-    void saveBinding(@NotNull Binding binding) throws IOException;
+    @Override
+    public void removeBinding(@NotNull String normalizedName) throws IOException {
+        File playerFile = getPlayerFile(normalizedName);
+        if (playerFile.exists()) {
+            Files.delete(playerFile.toPath());
+        }
+    }
+
+    @Override
+    public void shutdown() {
+        // No persistent file handles, so nothing to shut down.
+    }
 
     /**
-     * Removes a specific Binding from the storage backend.
-     *
-     * @param normalizedName The normalized name of the binding to remove.
-     * @throws IOException If a delete error occurs.
+     * Helper method to get the file path for a player.
      */
-    void removeBinding(@NotNull String normalizedName) throws IOException;
-
-    /**
-     * Shuts down the storage handler (e.g., closes file handles).
-     * (No longer strictly necessary for file-per-player, but good practice).
-     */
-    void shutdown();
+    @NotNull
+    private File getPlayerFile(@NotNull String normalizedName) {
+        // Sanitize the name to prevent path traversal
+        String sanitizedName = normalizedName.replaceAll("[^a-z0-9_]", "");
+        return new File(dataDirectory.toFile(), sanitizedName + ".yml");
+    }
 }
