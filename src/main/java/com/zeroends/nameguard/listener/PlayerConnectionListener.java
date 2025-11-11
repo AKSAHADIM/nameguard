@@ -6,6 +6,7 @@ import com.zeroends.nameguard.manager.ConfigManager;
 import com.zeroends.nameguard.model.Binding;
 import com.zeroends.nameguard.model.LoginResult;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -19,12 +20,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Listens for player connection events (login, join, quit)
- * to apply identity verification and manage session data (Hybrid Model).
- *
- * PATCH:
- * - Always persist binding to disk after session/trust change on quit (RAM and disk must be strongly consistent).
- * - On quit, reference the freshest data from disk to guarantee the playtime update won't be lost.
+ * Handles player connection events including login verification, session tracking,
+ * and binding updates upon disconnect.
  */
 public class PlayerConnectionListener implements Listener {
 
@@ -33,10 +30,8 @@ public class PlayerConnectionListener implements Listener {
     private final ConfigManager configManager;
     private final ConcurrentHashMap<String, Object> loginLocks;
 
-    // Simple in-memory map to track session start times for playtime calculation
+    // For session timing and marking new bindings
     private final ConcurrentHashMap<String, Long> sessionStartTime = new ConcurrentHashMap<>();
-
-    // Set to track new bindings across async/sync events
     private final Set<String> newBindings = ConcurrentHashMap.newKeySet();
 
     public PlayerConnectionListener(NameGuard plugin) {
@@ -49,62 +44,54 @@ public class PlayerConnectionListener implements Listener {
     @EventHandler(priority = EventPriority.HIGHEST)
     public void onAsyncPlayerPreLogin(AsyncPlayerPreLoginEvent event) {
         if (event.getLoginResult() != AsyncPlayerPreLoginEvent.Result.ALLOWED) {
-            return; // Already denied by another plugin
+            return;
         }
 
         String normalizedName = plugin.getNormalizationUtil().normalizeName(event.getName());
-
-        // Dapatkan lock untuk nama yang dinormalisasi ini
         Object lock = loginLocks.computeIfAbsent(normalizedName, k -> new Object());
 
         synchronized (lock) {
             try {
-                // Verifikasi login (sekarang bisa memicu I/O via BindingManager)
                 LoginResult result = bindingManager.verifyLogin(event);
-
-                if (result instanceof LoginResult.Denied deniedResult) {
-                    // Login ditolak
-                    event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
-                            Objects.requireNonNullElse(deniedResult.kickMessage(), Component.text("Login ditolak.")));
-
-                    if (configManager.isLogFailedAttempts()) {
-                        plugin.getSLF4JLogger().warn("Denied login for {}: {} (IP: {})",
-                                event.getName(), deniedResult.reason(), event.getAddress().getHostAddress());
-                    }
-
-                } else if (result instanceof LoginResult.Allowed allowedResult) {
-                    // Login diizinkan
-                    // Catat waktu mulai sesi untuk perhitungan playtime
-                    sessionStartTime.put(normalizedName, System.currentTimeMillis());
-
-                    // Tandai untuk mengirim pesan selamat datang jika binding baru
-                    if (allowedResult.isNewBinding()) {
-                        // Simpan nama ini untuk PlayerJoinEvent (yang berjalan di main thread)
-                        newBindings.add(normalizedName);
-                    }
-                }
-
+                handleLoginResult(event, result);
             } catch (Exception e) {
-                // Tangani error I/O dari BindingManager atau error lainnya
-                plugin.getSLF4JLogger().error("Error during login verification for {}", event.getName(), e);
+                plugin.getSLF4JLogger().error("Error during login verification for player '{}':", event.getName(), e);
                 event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
                         configManager.getKickMessage("internalError"));
             } finally {
-                // Selalu lepaskan lock setelah selesai
                 loginLocks.remove(normalizedName);
             }
+        }
+    }
+
+    private void handleLoginResult(AsyncPlayerPreLoginEvent event, LoginResult result) {
+        String normalizedName = plugin.getNormalizationUtil().normalizeName(event.getName());
+        if (result instanceof LoginResult.Denied deniedResult) {
+            event.disallow(AsyncPlayerPreLoginEvent.Result.KICK_OTHER,
+                    Objects.requireNonNullElse(deniedResult.kickMessage(), Component.text("Login denied.", NamedTextColor.RED)));
+            logLoginDenial(event, deniedResult);
+        } else if (result instanceof LoginResult.Allowed allowedResult) {
+            sessionStartTime.put(normalizedName, System.currentTimeMillis());
+            if (allowedResult.isNewBinding()) {
+                newBindings.add(normalizedName);
+            }
+        }
+    }
+
+    private void logLoginDenial(AsyncPlayerPreLoginEvent event, LoginResult.Denied deniedResult) {
+        if (configManager.isLogFailedAttempts()) {
+            plugin.getSLF4JLogger().warn("Denied login for player '{}': Reason - {} (IP: {})",
+                    event.getName(), deniedResult.reason(), event.getAddress().getHostAddress());
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerJoin(PlayerJoinEvent event) {
         String normalizedName = plugin.getNormalizationUtil().normalizeName(event.getPlayer().getName());
-
-        // Cek apakah ini binding baru (dari hasil verifikasi async)
         if (newBindings.remove(normalizedName)) {
-            // Ini adalah binding baru, kirim pesan sukses
-            if (!configManager.getProtectionSuccessMessage().equals(Component.empty())) {
-                event.getPlayer().sendMessage(configManager.getProtectionSuccessMessage());
+            Component protectionMessage = configManager.getProtectionSuccessMessage();
+            if (!protectionMessage.equals(Component.empty())) {
+                event.getPlayer().sendMessage(protectionMessage);
             }
         }
     }
@@ -112,36 +99,37 @@ public class PlayerConnectionListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerQuit(PlayerQuitEvent event) {
         String normalizedName = plugin.getNormalizationUtil().normalizeName(event.getPlayer().getName());
-
-        // Hapus waktu mulai sesi
         Long startTime = sessionStartTime.remove(normalizedName);
 
         if (startTime != null) {
             long sessionDuration = System.currentTimeMillis() - startTime;
-
-            try {
-                // Ambil binding TERBARU langsung dari disk, update playtime/trust,
-                // dan segera persist kembali (RAM dan disk harus selalu konsisten)
-                bindingManager.getBinding(normalizedName).ifPresent(binding -> {
-                    binding.addPlaytime(sessionDuration);
-
-                    // Perbarui trust level berdasarkan playtime
-                    if (binding.getTrust() == Binding.TrustLevel.LOW &&
-                            binding.getTotalPlaytime() > configManager.getLowTrustPlaytimeMillis()) {
-
-                        binding.setTrust(Binding.TrustLevel.MEDIUM);
-                        plugin.getSLF4JLogger().info("Updated trust level for {} to MEDIUM.", normalizedName);
-                    }
-                    // Setelah update, PERSIST ke disk segera
-                    bindingManager.saveBinding(binding);
-                });
-            } catch (IOException e) {
-                // Tetap tangani error, jangan gagal silent
-                plugin.getSLF4JLogger().error("Failed to retrieve/update binding for {} on quit.", normalizedName, e);
-            }
+            updatePlaytimeAndTrust(normalizedName, sessionDuration);
         }
 
-        // Simpan binding (yang sudah di-update di atas) ke disk dan hapus dari cache RAM
         bindingManager.unloadBinding(normalizedName);
+    }
+
+    private void updatePlaytimeAndTrust(String normalizedName, long sessionDuration) {
+        if (sessionDuration <= 0) {
+            return;
+        }
+
+        try {
+            bindingManager.getBinding(normalizedName).ifPresent(binding -> {
+                binding.addPlaytime(sessionDuration);
+                updateTrustLevelIfNecessary(binding);
+                bindingManager.saveBinding(binding);
+            });
+        } catch (IOException e) {
+            plugin.getSLF4JLogger().error("Failed to update binding for player '{}'.", normalizedName, e);
+        }
+    }
+
+    private void updateTrustLevelIfNecessary(Binding binding) {
+        if (binding.getTrust() == Binding.TrustLevel.LOW &&
+                binding.getTotalPlaytime() > configManager.getLowTrustPlaytimeMillis()) {
+            binding.setTrust(Binding.TrustLevel.MEDIUM);
+            plugin.getSLF4JLogger().info("Updated trust level for player '{}' to MEDIUM.", binding.getNormalizedName());
+        }
     }
 }
